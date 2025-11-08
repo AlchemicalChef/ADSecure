@@ -5,7 +5,7 @@
 $script:TierConfiguration = @{
     Tier0 = @{
         Name = 'Tier 0 - Infrastructure'
-        Description = 'Domain Controllers, core infrastructure, enterprise admins'
+        Description = 'Domain Controllers, core identity infrastructure, domain/enterprise admins'
         OUPath = 'OU=Tier0'
         Color = 'Red'
         RiskLevel = 'Critical'
@@ -19,7 +19,7 @@ $script:TierConfiguration = @{
     }
     Tier2 = @{
         Name = 'Tier 2 - Workstation Management'
-        Description = 'User workstations, end-user support, helpdesk'
+        Description = 'User workstations, etc'
         OUPath = 'OU=Tier2'
         Color = 'Green'
         RiskLevel = 'Medium'
@@ -3221,8 +3221,6 @@ function Set-ADTierSecurityPolicy {
                         
                         # Interactive logon
                         'Interactive logon: Do not display last user name' = 'Enabled'
-                        'Interactive logon: Machine inactivity limit' = '900' # 15 minutes
-                        'Interactive logon: Require smart card' = 'Enabled' # For Tier 0
                         
                         # Audit policies
                         'Audit: Force audit policy subcategory settings' = 'Enabled'
@@ -3239,7 +3237,7 @@ function Set-ADTierSecurityPolicy {
                     # Restrict software installation
                     Set-UserRight -GPOName $GPOName -UserRight 'SeLoadDriverPrivilege' -Identity 'Administrators'
                     
-                    Write-Host "Tier 0 security policies configured: Maximum security with smart card requirement" -ForegroundColor Green
+                    Write-Host "Tier 0 security policies configured: Maximum security with NTLMv2 and strict auditing" -ForegroundColor Green
                 }
                 
                 'Tier1' {
@@ -3256,7 +3254,6 @@ function Set-ADTierSecurityPolicy {
                         
                         # Interactive logon
                         'Interactive logon: Do not display last user name' = 'Enabled'
-                        'Interactive logon: Machine inactivity limit' = '1800' # 30 minutes
                         'Interactive logon: Number of previous logons to cache' = '2'
                         
                         # Audit policies
@@ -3294,7 +3291,6 @@ function Set-ADTierSecurityPolicy {
                         
                         # Interactive logon
                         'Interactive logon: Do not display last user name' = 'Disabled' # Allow for user workstations
-                        'Interactive logon: Machine inactivity limit' = '3600' # 60 minutes
                         'Interactive logon: Number of previous logons to cache' = '10'
                         
                         # Audit policies
