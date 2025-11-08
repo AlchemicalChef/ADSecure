@@ -1253,6 +1253,687 @@ function Repair-ADTierViolation {
 
 #endregion
 
+#region OU Management Functions
+
+function New-ADTierOUStructure {
+    <#
+    .SYNOPSIS
+        Creates a custom OU structure for a tier.
+    
+    .DESCRIPTION
+        Creates additional organizational units within a tier for better organization.
+    
+    .PARAMETER TierName
+        Target tier for the OU structure.
+    
+    .PARAMETER OUNames
+        Array of OU names to create.
+    
+    .EXAMPLE
+        New-ADTierOUStructure -TierName Tier1 -OUNames @('Databases', 'WebServers', 'ApplicationServers')
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('Tier0', 'Tier1', 'Tier2')]
+        [string]$TierName,
+        
+        [Parameter(Mandatory)]
+        [string[]]$OUNames
+    )
+    
+    $domainDN = Get-ADDomainRootDN
+    $tierConfig = $script:TierConfiguration[$TierName]
+    $tierOUPath = "$($tierConfig.OUPath),$domainDN"
+    
+    $results = @()
+    
+    foreach ($ouName in $OUNames) {
+        $ouPath = "OU=$ouName,$tierOUPath"
+        
+        if ($PSCmdlet.ShouldProcess($ouPath, "Create OU")) {
+            try {
+                if (-not (Test-ADTierOUExists -OUPath $ouPath)) {
+                    New-ADOrganizationalUnit -Name $ouName -Path $tierOUPath -ProtectedFromAccidentalDeletion $true
+                    
+                    $results += [PSCustomObject]@{
+                        TierName = $TierName
+                        OUName = $ouName
+                        Path = $ouPath
+                        Status = 'Created'
+                        Timestamp = Get-Date
+                    }
+                    
+                    Write-TierLog -Message "Created OU: $ouPath" -Level Success -Component 'OUManagement'
+                }
+                else {
+                    $results += [PSCustomObject]@{
+                        TierName = $TierName
+                        OUName = $ouName
+                        Path = $ouPath
+                        Status = 'AlreadyExists'
+                        Timestamp = Get-Date
+                    }
+                    Write-Warning "OU already exists: $ouPath"
+                }
+            }
+            catch {
+                $results += [PSCustomObject]@{
+                    TierName = $TierName
+                    OUName = $ouName
+                    Path = $ouPath
+                    Status = 'Failed'
+                    Error = $_.Exception.Message
+                    Timestamp = Get-Date
+                }
+                Write-TierLog -Message "Failed to create OU $ouPath : $_" -Level Error -Component 'OUManagement'
+            }
+        }
+    }
+    
+    return $results
+}
+
+function Get-ADTierOUStructure {
+    <#
+    .SYNOPSIS
+        Retrieves the complete OU structure for a tier.
+    
+    .DESCRIPTION
+        Returns all organizational units within a tier hierarchy.
+    
+    .PARAMETER TierName
+        Target tier to query.
+    
+    .PARAMETER IncludeEmptyOUs
+        Include OUs that contain no objects.
+    
+    .EXAMPLE
+        Get-ADTierOUStructure -TierName Tier1
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('Tier0', 'Tier1', 'Tier2')]
+        [string]$TierName,
+        
+        [switch]$IncludeEmptyOUs
+    )
+    
+    $domainDN = Get-ADDomainRootDN
+    $tierConfig = $script:TierConfiguration[$TierName]
+    $tierOUPath = "$($tierConfig.OUPath),$domainDN"
+    
+    try {
+        $ous = Get-ADOrganizationalUnit -SearchBase $tierOUPath -SearchScope Subtree -Filter * -Properties Description, ProtectedFromAccidentalDeletion
+        
+        $ouStructure = @()
+        
+        foreach ($ou in $ous) {
+            # Count objects in OU
+            $computers = (Get-ADComputer -SearchBase $ou.DistinguishedName -SearchScope OneLevel -Filter *).Count
+            $users = (Get-ADUser -SearchBase $ou.DistinguishedName -SearchScope OneLevel -Filter *).Count
+            $groups = (Get-ADGroup -SearchBase $ou.DistinguishedName -SearchScope OneLevel -Filter *).Count
+            $totalObjects = $computers + $users + $groups
+            
+            if ($IncludeEmptyOUs -or $totalObjects -gt 0) {
+                $ouStructure += [PSCustomObject]@{
+                    TierName = $TierName
+                    Name = $ou.Name
+                    DistinguishedName = $ou.DistinguishedName
+                    Description = $ou.Description
+                    Protected = $ou.ProtectedFromAccidentalDeletion
+                    Computers = $computers
+                    Users = $users
+                    Groups = $groups
+                    TotalObjects = $totalObjects
+                }
+            }
+        }
+        
+        return $ouStructure | Sort-Object DistinguishedName
+    }
+    catch {
+        Write-TierLog -Message "Failed to retrieve OU structure for $TierName : $_" -Level Error -Component 'OUManagement'
+        throw
+    }
+}
+
+#endregion
+
+#region Group Management Functions
+
+function New-ADTierGroup {
+    <#
+    .SYNOPSIS
+        Creates a new security group within a tier.
+    
+    .DESCRIPTION
+        Creates custom security groups for tier-specific access control.
+    
+    .PARAMETER TierName
+        Target tier for the group.
+    
+    .PARAMETER GroupName
+        Name of the group to create.
+    
+    .PARAMETER Description
+        Description of the group's purpose.
+    
+    .PARAMETER GroupScope
+        Group scope (Universal, Global, DomainLocal).
+    
+    .EXAMPLE
+        New-ADTierGroup -TierName Tier1 -GroupName "Tier1-SQLAdmins" -Description "SQL Server administrators"
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('Tier0', 'Tier1', 'Tier2')]
+        [string]$TierName,
+        
+        [Parameter(Mandatory)]
+        [string]$GroupName,
+        
+        [string]$Description,
+        
+        [ValidateSet('Universal', 'Global', 'DomainLocal')]
+        [string]$GroupScope = 'Universal'
+    )
+    
+    $domainDN = Get-ADDomainRootDN
+    $tierConfig = $script:TierConfiguration[$TierName]
+    $groupsOU = "OU=Groups,$($tierConfig.OUPath),$domainDN"
+    
+    if ($PSCmdlet.ShouldProcess($GroupName, "Create Security Group")) {
+        try {
+            $existingGroup = Get-ADGroup -Filter "Name -eq '$GroupName'" -ErrorAction SilentlyContinue
+            
+            if (-not $existingGroup) {
+                $groupParams = @{
+                    Name = $GroupName
+                    GroupScope = $GroupScope
+                    GroupCategory = 'Security'
+                    Path = $groupsOU
+                    Description = if ($Description) { $Description } else { "Custom group for $TierName" }
+                }
+                
+                New-ADGroup @groupParams
+                Write-TierLog -Message "Created group: $GroupName in $TierName" -Level Success -Component 'GroupManagement'
+                
+                return [PSCustomObject]@{
+                    TierName = $TierName
+                    GroupName = $GroupName
+                    GroupScope = $GroupScope
+                    Path = $groupsOU
+                    Status = 'Created'
+                    Timestamp = Get-Date
+                }
+            }
+            else {
+                Write-Warning "Group already exists: $GroupName"
+                return [PSCustomObject]@{
+                    TierName = $TierName
+                    GroupName = $GroupName
+                    Status = 'AlreadyExists'
+                }
+            }
+        }
+        catch {
+            Write-TierLog -Message "Failed to create group $GroupName : $_" -Level Error -Component 'GroupManagement'
+            throw
+        }
+    }
+}
+
+function Get-ADTierGroup {
+    <#
+    .SYNOPSIS
+        Retrieves all security groups within a tier.
+    
+    .DESCRIPTION
+        Returns all groups in the tier's Groups OU with membership information.
+    
+    .PARAMETER TierName
+        Target tier to query.
+    
+    .PARAMETER IncludeMembership
+        Include detailed group membership information.
+    
+    .EXAMPLE
+        Get-ADTierGroup -TierName Tier0 -IncludeMembership
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('Tier0', 'Tier1', 'Tier2')]
+        [string]$TierName,
+        
+        [switch]$IncludeMembership
+    )
+    
+    $domainDN = Get-ADDomainRootDN
+    $tierConfig = $script:TierConfiguration[$TierName]
+    $searchBase = "$($tierConfig.OUPath),$domainDN"
+    
+    try {
+        $groups = Get-ADGroup -SearchBase $searchBase -SearchScope Subtree -Filter * -Properties Description, Members, MemberOf
+        
+        $groupInfo = @()
+        
+        foreach ($group in $groups) {
+            $groupObj = [PSCustomObject]@{
+                TierName = $TierName
+                Name = $group.Name
+                SamAccountName = $group.SamAccountName
+                Description = $group.Description
+                GroupScope = $group.GroupScope
+                GroupCategory = $group.GroupCategory
+                MemberCount = $group.Members.Count
+                DistinguishedName = $group.DistinguishedName
+            }
+            
+            if ($IncludeMembership) {
+                $members = Get-ADGroupMember -Identity $group -ErrorAction SilentlyContinue
+                $groupObj | Add-Member -NotePropertyName 'Members' -NotePropertyValue ($members | Select-Object Name, ObjectClass, SamAccountName)
+            }
+            
+            $groupInfo += $groupObj
+        }
+        
+        return $groupInfo | Sort-Object Name
+    }
+    catch {
+        Write-TierLog -Message "Failed to retrieve groups for $TierName : $_" -Level Error -Component 'GroupManagement'
+        throw
+    }
+}
+
+function Add-ADTierGroupMember {
+    <#
+    .SYNOPSIS
+        Adds a member to a tier administrative group.
+    
+    .DESCRIPTION
+        Adds users, computers, or groups to tier-specific security groups with validation.
+    
+    .PARAMETER TierName
+        Target tier.
+    
+    .PARAMETER GroupSuffix
+        Group suffix (Admins, Operators, Readers).
+    
+    .PARAMETER Members
+        Array of members to add (SamAccountName).
+    
+    .EXAMPLE
+        Add-ADTierGroupMember -TierName Tier1 -GroupSuffix Admins -Members "john.admin"
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('Tier0', 'Tier1', 'Tier2')]
+        [string]$TierName,
+        
+        [Parameter(Mandatory)]
+        [ValidateSet('Admins', 'Operators', 'Readers', 'ServiceAccounts', 'JumpServers')]
+        [string]$GroupSuffix,
+        
+        [Parameter(Mandatory)]
+        [string[]]$Members
+    )
+    
+    $groupName = "$TierName-$GroupSuffix"
+    
+    try {
+        $group = Get-ADGroup -Filter "Name -eq '$groupName'" -ErrorAction Stop
+        
+        foreach ($member in $Members) {
+            if ($PSCmdlet.ShouldProcess($member, "Add to $groupName")) {
+                try {
+                    # Check if member exists
+                    $adObject = Get-ADObject -Filter "SamAccountName -eq '$member'" -ErrorAction Stop
+                    
+                    # Check if already a member
+                    $isMember = Get-ADGroupMember -Identity $group | Where-Object { $_.SamAccountName -eq $member }
+                    
+                    if (-not $isMember) {
+                        Add-ADGroupMember -Identity $group -Members $member
+                        Write-TierLog -Message "Added $member to $groupName" -Level Success -Component 'GroupManagement'
+                    }
+                    else {
+                        Write-Warning "$member is already a member of $groupName"
+                    }
+                }
+                catch {
+                    Write-TierLog -Message "Failed to add $member to $groupName : $_" -Level Error -Component 'GroupManagement'
+                }
+            }
+        }
+    }
+    catch {
+        Write-TierLog -Message "Group $groupName not found" -Level Error -Component 'GroupManagement'
+        throw
+    }
+}
+
+function Remove-ADTierGroupMember {
+    <#
+    .SYNOPSIS
+        Removes a member from a tier administrative group.
+    
+    .DESCRIPTION
+        Safely removes users, computers, or groups from tier-specific security groups.
+    
+    .PARAMETER TierName
+        Target tier.
+    
+    .PARAMETER GroupSuffix
+        Group suffix (Admins, Operators, Readers).
+    
+    .PARAMETER Members
+        Array of members to remove (SamAccountName).
+    
+    .EXAMPLE
+        Remove-ADTierGroupMember -TierName Tier1 -GroupSuffix Admins -Members "john.admin"
+    #>
+    [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('Tier0', 'Tier1', 'Tier2')]
+        [string]$TierName,
+        
+        [Parameter(Mandatory)]
+        [ValidateSet('Admins', 'Operators', 'Readers', 'ServiceAccounts', 'JumpServers')]
+        [string]$GroupSuffix,
+        
+        [Parameter(Mandatory)]
+        [string[]]$Members
+    )
+    
+    $groupName = "$TierName-$GroupSuffix"
+    
+    try {
+        $group = Get-ADGroup -Filter "Name -eq '$groupName'" -ErrorAction Stop
+        
+        foreach ($member in $Members) {
+            if ($PSCmdlet.ShouldProcess($member, "Remove from $groupName")) {
+                try {
+                    # Check if member exists in group
+                    $isMember = Get-ADGroupMember -Identity $group | Where-Object { $_.SamAccountName -eq $member }
+                    
+                    if ($isMember) {
+                        Remove-ADGroupMember -Identity $group -Members $member -Confirm:$false
+                        Write-TierLog -Message "Removed $member from $groupName" -Level Success -Component 'GroupManagement'
+                    }
+                    else {
+                        Write-Warning "$member is not a member of $groupName"
+                    }
+                }
+                catch {
+                    Write-TierLog -Message "Failed to remove $member from $groupName : $_" -Level Error -Component 'GroupManagement'
+                }
+            }
+        }
+    }
+    catch {
+        Write-TierLog -Message "Group $groupName not found" -Level Error -Component 'GroupManagement'
+        throw
+    }
+}
+
+#endregion
+
+#region Permission Management Functions
+
+function Set-ADTierPermission {
+    <#
+    .SYNOPSIS
+        Configures delegation of permissions for tier separation.
+    
+    .DESCRIPTION
+        Sets up proper ACLs to enforce tier separation and prevent privilege escalation.
+    
+    .PARAMETER TierName
+        Target tier to configure permissions for.
+    
+    .PARAMETER PermissionType
+        Type of permission to configure (FullControl, Modify, Read).
+    
+    .PARAMETER DelegateToGroup
+        Group to delegate permissions to.
+    
+    .EXAMPLE
+        Set-ADTierPermission -TierName Tier1 -PermissionType FullControl -DelegateToGroup "Tier1-Admins"
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('Tier0', 'Tier1', 'Tier2')]
+        [string]$TierName,
+        
+        [Parameter(Mandatory)]
+        [ValidateSet('FullControl', 'Modify', 'Read', 'CreateDeleteChild')]
+        [string]$PermissionType,
+        
+        [Parameter(Mandatory)]
+        [string]$DelegateToGroup
+    )
+    
+    $domainDN = Get-ADDomainRootDN
+    $tierConfig = $script:TierConfiguration[$TierName]
+    $tierOUPath = "$($tierConfig.OUPath),$domainDN"
+    
+    if ($PSCmdlet.ShouldProcess($tierOUPath, "Configure permissions for $DelegateToGroup")) {
+        try {
+            # Verify group exists
+            $group = Get-ADGroup -Filter "Name -eq '$DelegateToGroup'" -ErrorAction Stop
+            
+            # Get the OU object
+            $ou = Get-ADOrganizationalUnit -Identity $tierOUPath
+            
+            # Get current ACL
+            $acl = Get-Acl -Path "AD:\$($ou.DistinguishedName)"
+            
+            # Create the identity reference
+            $identity = [System.Security.Principal.NTAccount]$group.SamAccountName
+            
+            # Define rights based on permission type
+            $accessRights = switch ($PermissionType) {
+                'FullControl' { [System.DirectoryServices.ActiveDirectoryRights]::GenericAll }
+                'Modify' { [System.DirectoryServices.ActiveDirectoryRights]::WriteProperty }
+                'Read' { [System.DirectoryServices.ActiveDirectoryRights]::ReadProperty }
+                'CreateDeleteChild' { [System.DirectoryServices.ActiveDirectoryRights]::CreateChild -bor [System.DirectoryServices.ActiveDirectoryRights]::DeleteChild }
+            }
+            
+            # Create access rule
+            $accessRule = New-Object System.DirectoryServices.ActiveDirectoryAccessRule(
+                $identity,
+                $accessRights,
+                [System.Security.AccessControl.AccessControlType]::Allow,
+                [System.DirectoryServices.ActiveDirectorySecurityInheritance]::All
+            )
+            
+            # Add the rule
+            $acl.AddAccessRule($accessRule)
+            Set-Acl -Path "AD:\$($ou.DistinguishedName)" -AclObject $acl
+            
+            Write-TierLog -Message "Configured $PermissionType permissions for $DelegateToGroup on $TierName" -Level Success -Component 'PermissionManagement'
+            
+            return [PSCustomObject]@{
+                TierName = $TierName
+                OUPath = $tierOUPath
+                Group = $DelegateToGroup
+                PermissionType = $PermissionType
+                Status = 'Applied'
+                Timestamp = Get-Date
+            }
+        }
+        catch {
+            Write-TierLog -Message "Failed to configure permissions: $_" -Level Error -Component 'PermissionManagement'
+            throw
+        }
+    }
+}
+
+function Get-ADTierPermission {
+    <#
+    .SYNOPSIS
+        Retrieves permission delegations for a tier.
+    
+    .DESCRIPTION
+        Returns ACL information for tier OUs showing delegated permissions.
+    
+    .PARAMETER TierName
+        Target tier to query.
+    
+    .EXAMPLE
+        Get-ADTierPermission -TierName Tier1
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('Tier0', 'Tier1', 'Tier2')]
+        [string]$TierName
+    )
+    
+    $domainDN = Get-ADDomainRootDN
+    $tierConfig = $script:TierConfiguration[$TierName]
+    $tierOUPath = "$($tierConfig.OUPath),$domainDN"
+    
+    try {
+        $ou = Get-ADOrganizationalUnit -Identity $tierOUPath
+        $acl = Get-Acl -Path "AD:\$($ou.DistinguishedName)"
+        
+        $permissions = @()
+        
+        foreach ($access in $acl.Access) {
+            # Filter out inherited and system permissions for clarity
+            if (-not $access.IsInherited -and $access.IdentityReference -notlike "NT AUTHORITY\*" -and $access.IdentityReference -notlike "BUILTIN\*") {
+                $permissions += [PSCustomObject]@{
+                    TierName = $TierName
+                    Identity = $access.IdentityReference
+                    AccessControlType = $access.AccessControlType
+                    ActiveDirectoryRights = $access.ActiveDirectoryRights
+                    InheritanceType = $access.InheritanceType
+                    IsInherited = $access.IsInherited
+                }
+            }
+        }
+        
+        return $permissions
+    }
+    catch {
+        Write-TierLog -Message "Failed to retrieve permissions for $TierName : $_" -Level Error -Component 'PermissionManagement'
+        throw
+    }
+}
+
+function Test-ADTierPermissionCompliance {
+    <#
+    .SYNOPSIS
+        Tests tier permission configuration for security compliance.
+    
+    .DESCRIPTION
+        Validates that permissions are properly configured and tier separation is enforced.
+    
+    .PARAMETER TierName
+        Target tier to test.
+    
+    .EXAMPLE
+        Test-ADTierPermissionCompliance -TierName Tier0
+    #>
+    [CmdletBinding()]
+    param(
+        [ValidateSet('Tier0', 'Tier1', 'Tier2', 'All')]
+        [string]$TierName = 'All'
+    )
+    
+    $complianceResults = @()
+    
+    $tiersToTest = if ($TierName -eq 'All') {
+        $script:TierConfiguration.Keys
+    }
+    else {
+        @($TierName)
+    }
+    
+    foreach ($tier in $tiersToTest) {
+        Write-Verbose "Testing permissions for $tier..."
+        
+        try {
+            $permissions = Get-ADTierPermission -TierName $tier
+            
+            # Check for cross-tier permissions
+            foreach ($permission in $permissions) {
+                $identity = $permission.Identity.ToString()
+                
+                # Check if identity is from another tier
+                foreach ($otherTier in ($script:TierConfiguration.Keys | Where-Object { $_ -ne $tier })) {
+                    if ($identity -like "*$otherTier*") {
+                        $complianceResults += [PSCustomObject]@{
+                            TierName = $tier
+                            CheckType = 'CrossTierPermission'
+                            Status = 'Fail'
+                            Severity = 'High'
+                            Identity = $identity
+                            Issue = "Cross-tier permission detected: $otherTier identity has access to $tier"
+                            Recommendation = "Remove $identity from $tier permissions"
+                        }
+                    }
+                }
+            }
+            
+            # Check for excessive permissions
+            $excessivePermissions = $permissions | Where-Object { 
+                $_.ActiveDirectoryRights -match 'GenericAll' -and 
+                $_.Identity -notlike "*Domain Admins*" -and 
+                $_.Identity -notlike "*$tier-Admins*"
+            }
+            
+            foreach ($excessive in $excessivePermissions) {
+                $complianceResults += [PSCustomObject]@{
+                    TierName = $tier
+                    CheckType = 'ExcessivePermissions'
+                    Status = 'Warning'
+                    Severity = 'Medium'
+                    Identity = $excessive.Identity
+                    Issue = "Non-tier admin group has full control"
+                    Recommendation = "Review and restrict permissions for $($excessive.Identity)"
+                }
+            }
+            
+            # If no issues found
+            if (-not ($complianceResults | Where-Object { $_.TierName -eq $tier })) {
+                $complianceResults += [PSCustomObject]@{
+                    TierName = $tier
+                    CheckType = 'PermissionCompliance'
+                    Status = 'Pass'
+                    Severity = 'Info'
+                    Identity = 'N/A'
+                    Issue = 'No permission compliance issues detected'
+                    Recommendation = 'Continue monitoring'
+                }
+            }
+        }
+        catch {
+            $complianceResults += [PSCustomObject]@{
+                TierName = $tier
+                CheckType = 'PermissionCheck'
+                Status = 'Error'
+                Severity = 'High'
+                Identity = 'N/A'
+                Issue = "Failed to check permissions: $_"
+                Recommendation = 'Investigate permission check failure'
+            }
+        }
+    }
+    
+    return $complianceResults
+}
+
+#endregion
+
 #region Authentication Policy Functions
 
 function Set-ADTierAuthenticationPolicy {
