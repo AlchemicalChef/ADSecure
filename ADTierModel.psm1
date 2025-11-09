@@ -557,7 +557,7 @@ function Test-ADTier0Placement {
         [switch]$AutoDiscover
     )
     
-    Write-Host "`n=== Tier 0 Placement Validation ===" -ForegroundColor Cyan
+    Write-Host "=== Tier 0 Placement Validation ===" -ForegroundColor Cyan
     
     $infrastructure = Get-ADTier0Infrastructure
     
