@@ -49,7 +49,20 @@ $script:Tier0CriticalRoles = @{
     }
     PAW = @{
         Name = 'Privileged Access Workstation'
-        Detection = { (Get-ADComputer -Filter "Name -like 'PAW-*' -or Name -like '*-PAW-*'" -Properties Description | Where-Object { $_.Description -like '*PAW*' -or $_.Description -like '*Privileged Access*' }).Name }
+        Detection = {
+            try {
+                # AD Filter doesn't support -or, so use separate queries
+                $pawComputers = @()
+                $pawComputers += @(Get-ADComputer -Filter "Name -like 'PAW-*'" -Properties Description -ErrorAction SilentlyContinue)
+                $pawComputers += @(Get-ADComputer -Filter "Name -like '*-PAW-*'" -Properties Description -ErrorAction SilentlyContinue)
+                $pawComputers += @(Get-ADComputer -Filter "Description -like '*PAW*'" -Properties Description -ErrorAction SilentlyContinue)
+                $pawComputers += @(Get-ADComputer -Filter "Description -like '*Privileged Access*'" -Properties Description -ErrorAction SilentlyContinue)
+                $pawComputers | Select-Object -Unique -ExpandProperty Name
+            }
+            catch {
+                @()
+            }
+        }
         Description = 'Privileged Access Workstations for Tier 0 administration'
     }
 }
@@ -57,6 +70,124 @@ $script:Tier0CriticalRoles = @{
 $script:StandardSubOUs = @('Computers', 'Users', 'Groups', 'ServiceAccounts', 'AdminWorkstations')
 
 $script:ConfigPath = "$env:ProgramData\ADTierModel\config.json"
+
+#region Core Helper Functions (Must be defined first)
+
+function Ensure-TierDataDirectory {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    $programDataRoot = [System.IO.Path]::GetFullPath($env:ProgramData)
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+
+    if (-not $programDataRoot -or ($fullPath -notlike "$programDataRoot*")) {
+        throw "Invalid storage path specified: $fullPath"
+    }
+
+    if (-not (Test-Path $fullPath)) {
+        New-Item -Path $fullPath -ItemType Directory -Force | Out-Null
+    }
+
+    try {
+        $acl = New-Object System.Security.AccessControl.DirectorySecurity
+        $permissions = @(
+            New-Object System.Security.AccessControl.FileSystemAccessRule('BUILTIN\Administrators', 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow'),
+            New-Object System.Security.AccessControl.FileSystemAccessRule('SYSTEM', 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow')
+        )
+
+        foreach ($rule in $permissions) {
+            $acl.SetAccessRule($rule)
+        }
+
+        $acl.SetAccessRuleProtection($true, $false)
+        Set-Acl -Path $fullPath -AclObject $acl
+    }
+    catch {
+        Write-Warning "Unable to harden directory permissions for $fullPath: $_"
+    }
+}
+
+function Test-GroupPolicyModuleAvailable {
+    <#
+    .SYNOPSIS
+        Tests if the GroupPolicy module is available and can be loaded.
+    .OUTPUTS
+        Returns $true if available, $false otherwise.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param()
+
+    if (-not (Get-Module -Name GroupPolicy -ListAvailable)) {
+        return $false
+    }
+    try {
+        Import-Module GroupPolicy -ErrorAction Stop
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
+function Test-ADGroupExists {
+    <#
+    .SYNOPSIS
+        Validates that an AD group exists before attempting operations.
+    .OUTPUTS
+        Returns $true if group exists, $false otherwise.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory)]
+        [string]$GroupName
+    )
+
+    try {
+        $group = Get-ADGroup -Filter "Name -eq '$GroupName'" -ErrorAction Stop
+        return ($null -ne $group)
+    }
+    catch {
+        return $false
+    }
+}
+
+function Update-GPOVersion {
+    <#
+    .SYNOPSIS
+        Increments the GPO version to trigger replication.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [guid]$GPOGuid
+    )
+
+    try {
+        $domain = (Get-ADDomain).DNSRoot
+        $gpoGuidStr = $GPOGuid.ToString('B').ToUpper()
+        $gptIniPath = "\\$domain\SYSVOL\$domain\Policies\$gpoGuidStr\GPT.INI"
+
+        if (Test-Path $gptIniPath) {
+            $content = Get-Content $gptIniPath -Raw
+            if ($content -match 'Version=(\d+)') {
+                $newVersion = [int]$Matches[1] + 65536
+                $newContent = $content -replace "Version=\d+", "Version=$newVersion"
+                Set-Content -Path $gptIniPath -Value $newContent -Force
+                Write-Verbose "Updated GPO version to $newVersion"
+            }
+        }
+    }
+    catch {
+        Write-Warning "Failed to update GPO version: $_"
+    }
+}
+
+#endregion
 
 #region Helper Functions
 
@@ -215,11 +346,13 @@ function Initialize-ADTierModel {
     process {
         $domainDN = Get-ADDomainRootDN
         $results = @{
+            Success = $true
             OUsCreated = @()
             GroupsCreated = @()
             PermissionsSet = @()
             GPOsCreated = @()
             Errors = @()
+            Warnings = @()
         }
         
         # Create OU Structure
@@ -261,6 +394,7 @@ function Initialize-ADTierModel {
                         $errorMsg = "Failed to create OU $ouPath : $_"
                         Write-TierLog -Message $errorMsg -Level Error -Component 'Initialize'
                         $results.Errors += $errorMsg
+                        $results.Success = $false
                     }
                 }
             }
@@ -315,6 +449,7 @@ function Initialize-ADTierModel {
                             $errorMsg = "Failed to create group $groupName : $_"
                             Write-TierLog -Message $errorMsg -Level Error -Component 'Initialize'
                             $results.Errors += $errorMsg
+                            $results.Success = $false
                         }
                     }
                 }
@@ -387,6 +522,7 @@ function Initialize-ADTierModel {
                             $errorMsg = "Failed to create GPO $baseGPOName : $_"
                             Write-TierLog -Message $errorMsg -Level Error -Component 'Initialize'
                             $results.Errors += $errorMsg
+                            $results.Success = $false
                         }
                     }
                 }
@@ -414,12 +550,17 @@ function Initialize-ADTierModel {
         Write-Host "Groups Created: $($results.GroupsCreated.Count)" -ForegroundColor Green
         Write-Host "GPOs Created: $($results.GPOsCreated.Count)" -ForegroundColor Green
         Write-Host "Errors: $($results.Errors.Count)" -ForegroundColor $(if ($results.Errors.Count -eq 0) { 'Green' } else { 'Red' })
-        
+
+        $statusColor = if ($results.Success) { 'Green' } else { 'Red' }
+        $statusText = if ($results.Success) { 'SUCCESS' } else { 'PARTIAL FAILURE' }
+        Write-Host "Overall Status: $statusText" -ForegroundColor $statusColor
+
         if ($results.Errors.Count -gt 0) {
             Write-Host "`nErrors encountered:" -ForegroundColor Red
             $results.Errors | ForEach-Object { Write-Host "  - $_" -ForegroundColor Red }
+            Write-Warning "Initialization completed with $($results.Errors.Count) error(s). Some components may not be configured correctly."
         }
-        
+
         return $results
     }
 }
@@ -1177,9 +1318,16 @@ function Get-ADTierViolation {
     # Check for misplaced objects
     if ($ViolationType -in @('MisplacedObjects', 'All')) {
         Write-Verbose "Checking for misplaced objects..."
-        
+
         # Find domain controllers outside Tier0
-        $domainControllers = Get-ADDomainController -Filter *
+        try {
+            $domainControllers = @(Get-ADDomainController -Filter * -ErrorAction Stop)
+        }
+        catch {
+            # Fallback: Query Domain Controllers OU directly
+            Write-Verbose "Get-ADDomainController failed, using fallback method: $_"
+            $domainControllers = @(Get-ADComputer -SearchBase "OU=Domain Controllers,$(Get-ADDomainRootDN)" -Filter * -ErrorAction SilentlyContinue)
+        }
         $tier0OU = "$($script:TierConfiguration['Tier0'].OUPath),$(Get-ADDomainRootDN)"
         
         foreach ($dc in $domainControllers) {
@@ -1202,43 +1350,6 @@ function Get-ADTierViolation {
     
     Write-TierLog -Message "Found $($violations.Count) tier violations" -Level $(if ($violations.Count -gt 0) { 'Warning' } else { 'Info' }) -Component 'Audit'
     return $violations
-}
-
-function Ensure-TierDataDirectory {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]
-        [string]$Path
-    )
-
-    $programDataRoot = [System.IO.Path]::GetFullPath($env:ProgramData)
-    $fullPath = [System.IO.Path]::GetFullPath($Path)
-
-    if (-not $programDataRoot -or ($fullPath -notlike "$programDataRoot*")) {
-        throw "Invalid storage path specified: $fullPath"
-    }
-
-    if (-not (Test-Path $fullPath)) {
-        New-Item -Path $fullPath -ItemType Directory -Force | Out-Null
-    }
-
-    try {
-        $acl = New-Object System.Security.AccessControl.DirectorySecurity
-        $permissions = @(
-            New-Object System.Security.AccessControl.FileSystemAccessRule('BUILTIN\\Administrators', 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow'),
-            New-Object System.Security.AccessControl.FileSystemAccessRule('SYSTEM', 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow')
-        )
-
-        foreach ($rule in $permissions) {
-            $acl.SetAccessRule($rule)
-        }
-
-        $acl.SetAccessRuleProtection($true, $false)
-        Set-Acl -Path $fullPath -AclObject $acl
-    }
-    catch {
-        Write-Warning "Unable to harden directory permissions for $fullPath: $_"
-    }
 }
 
 function Test-ADTierCompliance {
@@ -1965,20 +2076,25 @@ function Add-ADTierGroupMember {
         [Parameter(Mandatory)]
         [ValidateSet('Tier0', 'Tier1', 'Tier2')]
         [string]$TierName,
-        
+
         [Parameter(Mandatory)]
         [ValidateSet('Admins', 'Operators', 'Readers', 'ServiceAccounts', 'JumpServers')]
         [string]$GroupSuffix,
-        
+
         [Parameter(Mandatory)]
         [string[]]$Members
     )
-    
+
     $groupName = "$TierName-$GroupSuffix"
-    
+
+    # Validate group exists before proceeding
+    if (-not (Test-ADGroupExists -GroupName $groupName)) {
+        throw "Group '$groupName' does not exist. Run Initialize-ADTierModel -CreateGroups first."
+    }
+
     try {
         $group = Get-ADGroup -Filter "Name -eq '$groupName'" -ErrorAction Stop
-        
+
         foreach ($member in $Members) {
             if ($PSCmdlet.ShouldProcess($member, "Add to $groupName")) {
                 try {
@@ -2677,13 +2793,18 @@ function Set-GPOUserRight {
         [Parameter(Mandatory)]
         [string[]]$Identity
     )
-    
+
+    # Guard: Ensure GroupPolicy module is available
+    if (-not (Test-GroupPolicyModuleAvailable)) {
+        throw "GroupPolicy module not available. Install RSAT tools to use GPO functions."
+    }
+
     try {
         # Get GPO GUID
         $gpo = Get-GPO -Name $GPOName
-        $gpoGuid = $gpo.Id
+        $gpoGuid = $gpo.Id.ToString('B').ToUpper()
         $domain = (Get-ADDomain).DNSRoot
-        $sysvol = "\\$domain\SYSVOL\$domain\Policies\{$gpoGuid}\Machine\Microsoft\Windows NT\SecEdit"
+        $sysvol = "\\$domain\SYSVOL\$domain\Policies\$gpoGuid\Machine\Microsoft\Windows NT\SecEdit"
         
         # Create directory if it doesn't exist
         if (-not (Test-Path $sysvol)) {
@@ -2753,11 +2874,10 @@ $UserRight = $sidString
         
         # Write INF file
         Set-Content -Path $infPath -Value $infContent -Encoding Unicode
-        
+
         # Increment GPO version to trigger replication
-        $gpo = Get-GPO -Guid $gpoGuid
-        $gpo.GpoStatus = $gpo.GpoStatus
-        
+        Update-GPOVersion -GPOGuid $gpo.Id
+
         Write-Verbose "Configured $UserRight for: $($Identity -join ', ')"
     }
     catch {
@@ -2788,13 +2908,19 @@ function Get-ADTierLogonRestrictions {
         [ValidateSet('Tier0', 'Tier1', 'Tier2')]
         [string]$TierName
     )
-    
+
+    # Guard: Ensure GroupPolicy module is available
+    if (-not (Test-GroupPolicyModuleAvailable)) {
+        Write-Warning "GroupPolicy module not available. Returning empty results."
+        return @()
+    }
+
     $tiers = if ($TierName) { @($TierName) } else { @('Tier0', 'Tier1', 'Tier2') }
     $results = @()
-    
+
     foreach ($tier in $tiers) {
         $gpoName = "SEC-$tier-LogonRestrictions"
-        
+
         try {
             $gpo = Get-GPO -Name $gpoName -ErrorAction SilentlyContinue
             
@@ -2834,18 +2960,28 @@ function Test-ADTierLogonRestrictions {
     #>
     [CmdletBinding()]
     param()
-    
+
+    # Guard: Ensure GroupPolicy module is available
+    if (-not (Test-GroupPolicyModuleAvailable)) {
+        Write-Warning "GroupPolicy module not available. Returning non-compliant status."
+        return @{
+            Compliant = $false
+            Findings = @("GroupPolicy module not available - cannot verify logon restrictions")
+            TierStatus = @{}
+        }
+    }
+
     $results = @{
         Compliant = $true
         Findings = @()
         TierStatus = @{}
     }
-    
+
     foreach ($tierKey in $script:TierConfiguration.Keys) {
         $gpoName = "SEC-$tierKey-LogonRestrictions"
         $domainDN = Get-ADDomainRootDN
         $ouPath = "$($script:TierConfiguration[$tierKey].OUPath),$domainDN"
-        
+
         # Check if GPO exists
         $gpo = Get-GPO -Name $gpoName -ErrorAction SilentlyContinue
         
@@ -2883,7 +3019,13 @@ function Get-GPOLinks {
         [Parameter(Mandatory)]
         [string]$GPOName
     )
-    
+
+    # Guard: Ensure GroupPolicy module is available
+    if (-not (Test-GroupPolicyModuleAvailable)) {
+        Write-Warning "GroupPolicy module not available. Returning empty results."
+        return @()
+    }
+
     try {
         $gpo = Get-GPO -Name $GPOName
         $report = [xml](Get-GPOReport -Name $GPOName -ReportType Xml)
@@ -3031,15 +3173,21 @@ function New-ADTierAdminAccount {
                 # Create the user account
                 New-ADUser @userParams
                 Write-TierLog -Message "Created user account: $Username" -Level Success -Component 'AccountManagement'
-                
+
                 # Add to tier admin group
                 $adminGroup = "$TierName-Admins"
-                Add-ADGroupMember -Identity $adminGroup -Members $Username
+
+                # Validate group exists before adding member
+                if (-not (Test-ADGroupExists -GroupName $adminGroup)) {
+                    throw "Admin group '$adminGroup' does not exist. Run Initialize-ADTierModel -CreateGroups first."
+                }
+
+                Add-ADGroupMember -Identity $adminGroup -Members $Username -ErrorAction Stop
                 Write-TierLog -Message "Added $Username to $adminGroup" -Level Success -Component 'AccountManagement'
                 
-                # Configure lockout protection if requested
+                # Configure lockout protection if requested (sets AccountNotDelegated flag)
                 if ($NoLockout) {
-                    Set-ADUser -Identity $Username -Replace @{msDS-User-Account-Control-Computed = 0x10000}
+                    Set-ADAccountControl -Identity $Username -AccountNotDelegated $true
                     Write-TierLog -Message "Configured lockout protection for $Username" -Level Info -Component 'AccountManagement'
                     Write-Warning "Account $Username is protected from lockout. Use this feature sparingly."
                 }
@@ -3123,8 +3271,8 @@ function Set-ADTierAccountLockoutProtection {
             
             if ($PSCmdlet.ShouldProcess($Identity, "Configure Lockout Protection")) {
                 if ($Disable) {
-                    # Remove lockout protection
-                    Set-ADUser -Identity $Identity -Clear msDS-User-Account-Control-Computed
+                    # Remove lockout protection (clears AccountNotDelegated flag)
+                    Set-ADAccountControl -Identity $Identity -AccountNotDelegated $false
                     Write-TierLog -Message "Disabled lockout protection for $Identity" -Level Info -Component 'AccountManagement'
                     Write-Host "Lockout protection disabled for: $Identity" -ForegroundColor Green
                 }
@@ -3262,12 +3410,17 @@ function Set-ADTierSecurityPolicy {
         
         [string]$GPOName
     )
-    
+
+    # Guard: Ensure GroupPolicy module is available
+    if (-not (Test-GroupPolicyModuleAvailable)) {
+        throw "GroupPolicy module not available. Install RSAT tools to use GPO functions."
+    }
+
     try {
         if (-not $GPOName) {
             $GPOName = "SEC-$TierName-BasePolicy"
         }
-        
+
         # Verify GPO exists
         $gpo = Get-GPO -Name $GPOName -ErrorAction SilentlyContinue
         if (-not $gpo) {
@@ -3309,7 +3462,7 @@ function Set-ADTierSecurityPolicy {
                     Set-GPOAuditPolicy -GPOName $GPOName -Category 'Privilege Use' -SubCategory 'Sensitive Privilege Use' -Success -Failure
                     
                     # Restrict software installation
-                    Set-UserRight -GPOName $GPOName -UserRight 'SeLoadDriverPrivilege' -Identity 'Administrators'
+                    Set-GPOUserRight -GPOName $GPOName -UserRight 'SeLoadDriverPrivilege' -Identity 'Administrators'
                     
                     Write-Host "Tier 0 security policies configured: Maximum security with NTLMv2 and strict auditing" -ForegroundColor Green
                 }
@@ -3401,132 +3554,293 @@ function Set-ADTierSecurityPolicy {
 function Set-GPOSecurityOption {
     <#
     .SYNOPSIS
-        Helper function to set security options in a GPO.
-    
+        Configures security options in a GPO via GptTmpl.inf manipulation.
+
     .DESCRIPTION
-        Configures security options in the specified GPO using secedit.
-    
+        Writes security settings to the GPO's GptTmpl.inf file in SYSVOL.
+
     .PARAMETER GPOName
         The name of the GPO to configure.
-    
+
     .PARAMETER Settings
         Hashtable of security settings to apply.
     #>
-    [CmdletBinding()]
+    [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)]
         [string]$GPOName,
-        
+
         [Parameter(Mandatory)]
         [hashtable]$Settings
     )
-    
-    Write-Verbose "Configuring security options in GPO: $GPOName"
-    
-    # Note: This is a simplified implementation
-    # In production, you would use secedit or direct SYSVOL manipulation
-    # For demonstration, we'll log the settings that would be applied
-    
-    foreach ($setting in $Settings.GetEnumerator()) {
-        Write-Verbose "  $($setting.Key) = $($setting.Value)"
-        Write-TierLog -Message "Would configure: $($setting.Key) = $($setting.Value)" -Level Info -Component 'GPO'
+
+    # Guard: Ensure GroupPolicy module is available
+    if (-not (Test-GroupPolicyModuleAvailable)) {
+        throw "GroupPolicy module not available. Install RSAT tools."
     }
-    
-    Write-Warning "Security option configuration requires direct GPO manipulation via secedit or registry. Settings have been logged."
+
+    # Security option registry path mappings
+    $securityOptionMap = @{
+        'Network security: LAN Manager authentication level' = 'MACHINE\System\CurrentControlSet\Control\Lsa\LmCompatibilityLevel'
+        'Network security: Do not store LAN Manager hash value on next password change' = 'MACHINE\System\CurrentControlSet\Control\Lsa\NoLMHash'
+        'Network security: Minimum session security for NTLM SSP based clients' = 'MACHINE\System\CurrentControlSet\Control\Lsa\MSV1_0\NTLMMinClientSec'
+        'Network security: Minimum session security for NTLM SSP based servers' = 'MACHINE\System\CurrentControlSet\Control\Lsa\MSV1_0\NTLMMinServerSec'
+        'Interactive logon: Do not display last user name' = 'MACHINE\Software\Microsoft\Windows\CurrentVersion\Policies\System\DontDisplayLastUserName'
+        'Accounts: Administrator account status' = 'MACHINE\SAM\SAM\Domains\Account\Users\000001F4\F'
+    }
+
+    try {
+        $gpo = Get-GPO -Name $GPOName -ErrorAction Stop
+        $gpoGuid = $gpo.Id.ToString('B').ToUpper()
+        $domain = (Get-ADDomain).DNSRoot
+        $sysvolPath = "\\$domain\SYSVOL\$domain\Policies\$gpoGuid\Machine\Microsoft\Windows NT\SecEdit"
+        $infPath = Join-Path $sysvolPath "GptTmpl.inf"
+
+        # Ensure directory exists
+        if (-not (Test-Path $sysvolPath)) {
+            New-Item -Path $sysvolPath -ItemType Directory -Force -ErrorAction Stop | Out-Null
+        }
+
+        # Build INF content
+        $infContent = @()
+        $infContent += "[Unicode]"
+        $infContent += "Unicode=yes"
+        $infContent += "[Version]"
+        $infContent += 'signature="$CHICAGO$"'
+        $infContent += "Revision=1"
+        $infContent += "[Registry Values]"
+
+        foreach ($setting in $Settings.GetEnumerator()) {
+            $regKey = $securityOptionMap[$setting.Key]
+            if ($regKey) {
+                # Convert value based on setting type
+                $value = switch -Regex ($setting.Key) {
+                    'LAN Manager authentication level' {
+                        switch ($setting.Value) {
+                            'Send NTLMv2 response only. Refuse LM & NTLM' { '4,5' }
+                            'Send NTLMv2 response only. Refuse LM' { '4,4' }
+                            'Send NTLMv2 response only' { '4,3' }
+                            default { "4,$($setting.Value)" }
+                        }
+                    }
+                    'Enabled|Disabled|status' {
+                        if ($setting.Value -match 'Enabled|1') { '4,1' } else { '4,0' }
+                    }
+                    default { "4,$($setting.Value)" }
+                }
+                $infContent += "$regKey=$value"
+                Write-Verbose "Configured: $($setting.Key) = $($setting.Value)"
+            }
+            else {
+                Write-Warning "Unknown security option: $($setting.Key)"
+            }
+        }
+
+        if ($PSCmdlet.ShouldProcess($GPOName, "Configure Security Options")) {
+            Set-Content -Path $infPath -Value ($infContent -join "`r`n") -Encoding Unicode -Force -ErrorAction Stop
+            Update-GPOVersion -GPOGuid $gpo.Id
+            Write-TierLog -Message "Configured security options in GPO: $GPOName" -Level Success -Component 'GPO'
+        }
+    }
+    catch {
+        Write-TierLog -Message "Failed to configure security options: $_" -Level Error -Component 'GPO'
+        throw
+    }
 }
 
 function Set-GPOAuditPolicy {
     <#
     .SYNOPSIS
-        Configures audit policies in a GPO.
-    
+        Configures audit policies in a GPO via audit.csv manipulation.
+
     .PARAMETER GPOName
         The name of the GPO to configure.
-    
+
     .PARAMETER Category
         Audit category (e.g., 'Account Logon', 'Logon/Logoff').
-    
+
     .PARAMETER SubCategory
         Audit subcategory (e.g., 'Credential Validation', 'Logon').
-    
+
     .PARAMETER Success
         Enable success auditing.
-    
+
     .PARAMETER Failure
         Enable failure auditing.
     #>
-    [CmdletBinding()]
+    [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)]
         [string]$GPOName,
-        
+
         [Parameter(Mandatory)]
         [string]$Category,
-        
+
         [Parameter(Mandatory)]
         [string]$SubCategory,
-        
+
         [switch]$Success,
         [switch]$Failure
     )
-    
-    $auditValue = @()
-    if ($Success) { $auditValue += 'Success' }
-    if ($Failure) { $auditValue += 'Failure' }
-    
-    Write-Verbose "Configuring audit policy: $Category\$SubCategory = $($auditValue -join ', ')"
-    Write-TierLog -Message "Would configure audit: $Category\$SubCategory = $($auditValue -join ', ')" -Level Info -Component 'GPO'
+
+    # Guard: Ensure GroupPolicy module is available
+    if (-not (Test-GroupPolicyModuleAvailable)) {
+        throw "GroupPolicy module not available. Install RSAT tools."
+    }
+
+    # Audit subcategory GUID mappings
+    $auditGuidMap = @{
+        'Credential Validation' = '{0CCE923F-69AE-11D9-BED3-505054503030}'
+        'Kerberos Authentication Service' = '{0CCE9242-69AE-11D9-BED3-505054503030}'
+        'User Account Management' = '{0CCE9235-69AE-11D9-BED3-505054503030}'
+        'Computer Account Management' = '{0CCE9236-69AE-11D9-BED3-505054503030}'
+        'Security Group Management' = '{0CCE9237-69AE-11D9-BED3-505054503030}'
+        'Directory Service Changes' = '{0CCE923C-69AE-11D9-BED3-505054503030}'
+        'Directory Service Access' = '{0CCE923B-69AE-11D9-BED3-505054503030}'
+        'Logon' = '{0CCE9215-69AE-11D9-BED3-505054503030}'
+        'Logoff' = '{0CCE9216-69AE-11D9-BED3-505054503030}'
+        'Special Logon' = '{0CCE921B-69AE-11D9-BED3-505054503030}'
+        'Audit Policy Change' = '{0CCE922F-69AE-11D9-BED3-505054503030}'
+        'Authentication Policy Change' = '{0CCE9230-69AE-11D9-BED3-505054503030}'
+        'Sensitive Privilege Use' = '{0CCE9228-69AE-11D9-BED3-505054503030}'
+        'File Share' = '{0CCE9224-69AE-11D9-BED3-505054503030}'
+        'Process Creation' = '{0CCE922B-69AE-11D9-BED3-505054503030}'
+    }
+
+    $subcatGuid = $auditGuidMap[$SubCategory]
+    if (-not $subcatGuid) {
+        Write-Warning "Unknown audit subcategory: $SubCategory"
+        return
+    }
+
+    # Calculate setting value (1=Success, 2=Failure, 3=Both, 0=None)
+    $settingValue = 0
+    if ($Success) { $settingValue = $settingValue -bor 1 }
+    if ($Failure) { $settingValue = $settingValue -bor 2 }
+
+    try {
+        $gpo = Get-GPO -Name $GPOName -ErrorAction Stop
+        $gpoGuid = $gpo.Id.ToString('B').ToUpper()
+        $domain = (Get-ADDomain).DNSRoot
+        $auditDir = "\\$domain\SYSVOL\$domain\Policies\$gpoGuid\Machine\Microsoft\Windows NT\Audit"
+        $auditCsvPath = Join-Path $auditDir "audit.csv"
+
+        # Ensure directory exists
+        if (-not (Test-Path $auditDir)) {
+            New-Item -Path $auditDir -ItemType Directory -Force -ErrorAction Stop | Out-Null
+        }
+
+        if ($PSCmdlet.ShouldProcess($GPOName, "Configure Audit Policy: $Category\$SubCategory")) {
+            # Create or update audit.csv
+            $csvContent = @()
+            $csvContent += "Machine Name,Policy Target,Subcategory,Subcategory GUID,Inclusion Setting,Exclusion Setting,Setting Value"
+            $csvContent += ",$subcatGuid,$SubCategory,$subcatGuid,,$settingValue"
+
+            # If file exists, merge with existing entries
+            if (Test-Path $auditCsvPath) {
+                $existing = Import-Csv $auditCsvPath -ErrorAction SilentlyContinue
+                foreach ($entry in $existing) {
+                    if ($entry.'Subcategory GUID' -ne $subcatGuid) {
+                        $csvContent += ",$($entry.'Subcategory GUID'),$($entry.Subcategory),$($entry.'Subcategory GUID'),,$($entry.'Setting Value')"
+                    }
+                }
+            }
+
+            $csvContent | Set-Content -Path $auditCsvPath -Encoding Unicode -Force -ErrorAction Stop
+            Update-GPOVersion -GPOGuid $gpo.Id
+            Write-TierLog -Message "Configured audit policy: $Category\$SubCategory" -Level Success -Component 'GPO'
+        }
+    }
+    catch {
+        Write-TierLog -Message "Failed to configure audit policy: $_" -Level Error -Component 'GPO'
+        throw
+    }
 }
 
 function Set-GPOFirewall {
     <#
     .SYNOPSIS
-        Configures Windows Firewall settings in a GPO.
+        Configures Windows Firewall settings in a GPO via registry policy.
     #>
-    [CmdletBinding()]
+    [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)]
         [string]$GPOName,
-        
+
         [Parameter(Mandatory)]
         [ValidateSet('Domain', 'Private', 'Public')]
         [string]$Profile,
-        
+
         [Parameter(Mandatory)]
         [ValidateSet('On', 'Off')]
         [string]$State
     )
-    
-    Write-Verbose "Configuring Windows Firewall: $Profile profile = $State"
-    Write-TierLog -Message "Would configure firewall: $Profile profile = $State" -Level Info -Component 'GPO'
+
+    # Guard: Ensure GroupPolicy module is available
+    if (-not (Test-GroupPolicyModuleAvailable)) {
+        throw "GroupPolicy module not available. Install RSAT tools."
+    }
+
+    $profileMap = @{
+        'Domain' = 'DomainProfile'
+        'Private' = 'StandardProfile'
+        'Public' = 'PublicProfile'
+    }
+
+    $key = "HKLM\SOFTWARE\Policies\Microsoft\WindowsFirewall\$($profileMap[$Profile])"
+    $value = if ($State -eq 'On') { 1 } else { 0 }
+
+    try {
+        if ($PSCmdlet.ShouldProcess($GPOName, "Configure Firewall: $Profile = $State")) {
+            Set-GPRegistryValue -Name $GPOName -Key $key -ValueName 'EnableFirewall' -Type DWord -Value $value -ErrorAction Stop
+            Write-TierLog -Message "Configured firewall: $Profile = $State in GPO $GPOName" -Level Success -Component 'GPO'
+        }
+    }
+    catch {
+        Write-TierLog -Message "Failed to configure firewall: $_" -Level Error -Component 'GPO'
+        throw
+    }
 }
 
 function Set-GPORegistryValue {
     <#
     .SYNOPSIS
-        Sets registry values in a GPO.
+        Sets registry values in a GPO using the GroupPolicy module.
     #>
-    [CmdletBinding()]
+    [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)]
         [string]$GPOName,
-        
+
         [Parameter(Mandatory)]
         [string]$Key,
-        
+
         [Parameter(Mandatory)]
         [string]$ValueName,
-        
+
         [Parameter(Mandatory)]
         [ValidateSet('String', 'DWord', 'Binary', 'ExpandString', 'MultiString', 'QWord')]
         [string]$Type,
-        
+
         [Parameter(Mandatory)]
         $Value
     )
-    
-    Write-Verbose "Setting registry value: $Key\$ValueName = $Value ($Type)"
-    Write-TierLog -Message "Would set registry: $Key\$ValueName = $Value ($Type)" -Level Info -Component 'GPO'
+
+    # Guard: Ensure GroupPolicy module is available
+    if (-not (Test-GroupPolicyModuleAvailable)) {
+        throw "GroupPolicy module not available. Install RSAT tools."
+    }
+
+    try {
+        if ($PSCmdlet.ShouldProcess($GPOName, "Set Registry: $Key\$ValueName = $Value")) {
+            Set-GPRegistryValue -Name $GPOName -Key $Key -ValueName $ValueName -Type $Type -Value $Value -ErrorAction Stop
+            Write-TierLog -Message "Set registry value: $Key\$ValueName in GPO $GPOName" -Level Success -Component 'GPO'
+        }
+    }
+    catch {
+        Write-TierLog -Message "Failed to set registry value: $_" -Level Error -Component 'GPO'
+        throw
+    }
 }
 
 #endregion

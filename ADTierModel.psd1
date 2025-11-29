@@ -15,40 +15,64 @@
         # Initialization
         'Initialize-ADTierModel',
         'Get-ADTierConfiguration',
-        
+
+        # Tier 0 Detection
+        'Get-ADTier0Infrastructure',
+        'Test-ADTier0Placement',
+        'Move-ADTier0Infrastructure',
+
         # Tier Management
         'New-ADTier',
         'Get-ADTier',
         'Set-ADTierMember',
         'Remove-ADTierMember',
         'Get-ADTierMember',
-        
+
         # OU Management
         'New-ADTierOUStructure',
         'Get-ADTierOUStructure',
-        
+
         # Group Management
         'New-ADTierGroup',
         'Get-ADTierGroup',
         'Add-ADTierGroupMember',
         'Remove-ADTierGroupMember',
-        
+
         # Permission Management
         'Set-ADTierPermission',
         'Get-ADTierPermission',
         'Test-ADTierPermissionCompliance',
-        
+
         # Auditing and Monitoring
         'Get-ADTierAccessReport',
         'Get-ADTierViolation',
         'Test-ADTierCompliance',
         'Export-ADTierAuditLog',
-        
+
         # Security Policies
         'Set-ADTierAuthenticationPolicy',
         'Get-ADTierAuthenticationPolicy',
         'Set-ADTierPasswordPolicy',
-        
+
+        # Logon Restrictions
+        'Set-ADTierLogonRestrictions',
+        'Get-ADTierLogonRestrictions',
+        'Test-ADTierLogonRestrictions',
+        'Get-GPOLinks',
+        'Set-GPOUserRight',
+
+        # Admin Account Management
+        'New-ADTierAdminAccount',
+        'Set-ADTierAccountLockoutProtection',
+        'Get-ADTierAdminAccount',
+
+        # Enhanced Security Policies
+        'Set-ADTierSecurityPolicy',
+        'Set-GPOSecurityOption',
+        'Set-GPOAuditPolicy',
+        'Set-GPOFirewall',
+        'Set-GPORegistryValue',
+
         # Cross-Tier Detection
         'Find-ADCrossTierAccess',
         'Find-ADTierMisconfiguration',
