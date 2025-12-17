@@ -15,11 +15,13 @@
         # Initialization
         'Initialize-ADTierModel',
         'Get-ADTierConfiguration',
+        'Get-ADTierInitializationStatus',
 
         # Tier 0 Detection
         'Get-ADTier0Infrastructure',
         'Test-ADTier0Placement',
         'Move-ADTier0Infrastructure',
+        'Get-ADFSMORoleHolders',
 
         # Tier Management
         'New-ADTier',
@@ -27,6 +29,7 @@
         'Set-ADTierMember',
         'Remove-ADTierMember',
         'Get-ADTierMember',
+        'Get-ADTierCounts',
 
         # OU Management
         'New-ADTierOUStructure',
@@ -37,6 +40,9 @@
         'Get-ADTierGroup',
         'Add-ADTierGroupMember',
         'Remove-ADTierGroupMember',
+        'Get-ADTransitiveGroupMembership',
+        'Resolve-ADPrimaryGroup',
+        'Get-ADLargeGroupMembers',
 
         # Permission Management
         'Set-ADTierPermission',
@@ -76,7 +82,23 @@
         # Cross-Tier Detection
         'Find-ADCrossTierAccess',
         'Find-ADTierMisconfiguration',
-        'Repair-ADTierViolation'
+        'Repair-ADTierViolation',
+
+        # Compliance (from Rust port)
+        'Get-ADTierComplianceScore',
+        'Disable-ADStaleAccounts',
+        'Set-ADServiceAccountHardening',
+
+        # Diagnostics (from Rust port)
+        'Test-ADConnection',
+
+        # Endpoint Protection GPOs (from Rust port)
+        'Get-ADEndpointProtectionStatus',
+        'New-ADAuditBaselineGPO',
+        'New-ADAuditEnhancedGPO',
+        'New-ADDcAuditEssentialGPO',
+        'New-ADDcAuditComprehensiveGPO',
+        'New-ADDefenderProtectionGPO'
     )
     
     CmdletsToExport = @()

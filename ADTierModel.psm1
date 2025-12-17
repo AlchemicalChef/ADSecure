@@ -2,6 +2,15 @@
 #Requires -Version 5.1
 
 # Module-level variables
+
+# Constants - Named values for clarity and maintainability
+$script:GPO_USER_VERSION_INCREMENT = 65536   # High 16 bits: User configuration version
+$script:GPO_COMPUTER_VERSION_INCREMENT = 1    # Low 16 bits: Computer configuration version
+$script:AD_MAX_VALUES_RANGE = 1500            # Default MaxValRange for ranged retrieval
+$script:MAX_LOG_MESSAGE_LENGTH = 4000         # Maximum log message length before truncation
+$script:SAFETY_LIMIT_ITERATIONS = 1000000     # Safety limit for infinite loop prevention
+$script:DC_PRIMARY_GROUP_ID = 516             # primaryGroupID for Domain Controllers
+
 $script:TierConfiguration = @{
     Tier0 = @{
         Name = 'Tier 0 - Infrastructure'
@@ -29,35 +38,56 @@ $script:TierConfiguration = @{
 $script:Tier0CriticalRoles = @{
     DomainController = @{
         Name = 'Domain Controller'
-        Detection = { (Get-ADComputer -Filter * -Properties OperatingSystem | Where-Object { $_.DistinguishedName -like '*Domain Controllers*' }).Name }
+        Detection = {
+            # Use SearchBase for efficient query instead of -Filter * with client-side filtering
+            try {
+                $dcOU = "OU=Domain Controllers,$((Get-ADDomain -ErrorAction Stop).DistinguishedName)"
+                (Get-ADComputer -SearchBase $dcOU -Filter * -Properties Name -ErrorAction SilentlyContinue).Name
+            } catch {
+                # Fallback: query by primaryGroupID (516 = Domain Controllers)
+                (Get-ADComputer -Filter "primaryGroupID -eq $($script:DC_PRIMARY_GROUP_ID)" -Properties Name -ErrorAction SilentlyContinue).Name
+            }
+        }
         Description = 'Active Directory Domain Controllers'
     }
     ADFS = @{
         Name = 'AD FS Server'
-        Detection = { (Get-ADComputer -Filter * -Properties ServicePrincipalName | Where-Object { $_.ServicePrincipalName -like '*http/sts*' -or $_.ServicePrincipalName -like '*http/adfs*' }).Name }
+        Detection = {
+            # Filter by SPN server-side where possible, then client-side filter for specific patterns
+            (Get-ADComputer -Filter "ServicePrincipalName -like '*http*'" -Properties ServicePrincipalName -ErrorAction SilentlyContinue |
+                Where-Object { $_.ServicePrincipalName -like '*http/sts*' -or $_.ServicePrincipalName -like '*http/adfs*' }).Name
+        }
         Description = 'Active Directory Federation Services servers'
     }
     EntraConnect = @{
         Name = 'Entra Connect (AAD Connect)'
-        Detection = { (Get-ADComputer -Filter * -Properties Description | Where-Object { $_.Description -like '*Azure AD Connect*' -or $_.Description -like '*AAD Connect*' -or $_.Description -like '*Entra Connect*' }).Name }
+        Detection = {
+            # Use more specific filter to reduce result set
+            (Get-ADComputer -Filter "Description -like '*Connect*'" -Properties Description -ErrorAction SilentlyContinue |
+                Where-Object { $_.Description -like '*Azure AD Connect*' -or $_.Description -like '*AAD Connect*' -or $_.Description -like '*Entra Connect*' }).Name
+        }
         Description = 'Microsoft Entra Connect (Azure AD Connect) synchronization servers'
     }
     CertificateAuthority = @{
         Name = 'Certificate Authority'
-        Detection = { (Get-ADComputer -Filter * -Properties Description | Where-Object { $_.Description -like '*Certificate Authority*' -or $_.Description -like '*CA Server*' }).Name }
+        Detection = {
+            # Use more specific filter to reduce result set
+            (Get-ADComputer -Filter "Description -like '*Certificate*' -or Description -like '*CA*'" -Properties Description -ErrorAction SilentlyContinue |
+                Where-Object { $_.Description -like '*Certificate Authority*' -or $_.Description -like '*CA Server*' }).Name
+        }
         Description = 'Enterprise Certificate Authority servers'
     }
     PAW = @{
         Name = 'Privileged Access Workstation'
         Detection = {
             try {
-                # AD Filter doesn't support -or, so use separate queries
-                $pawComputers = @()
-                $pawComputers += @(Get-ADComputer -Filter "Name -like 'PAW-*'" -Properties Description -ErrorAction SilentlyContinue)
-                $pawComputers += @(Get-ADComputer -Filter "Name -like '*-PAW-*'" -Properties Description -ErrorAction SilentlyContinue)
-                $pawComputers += @(Get-ADComputer -Filter "Description -like '*PAW*'" -Properties Description -ErrorAction SilentlyContinue)
-                $pawComputers += @(Get-ADComputer -Filter "Description -like '*Privileged Access*'" -Properties Description -ErrorAction SilentlyContinue)
-                $pawComputers | Select-Object -Unique -ExpandProperty Name
+                # Use pipeline aggregation instead of array += for performance
+                @(
+                    Get-ADComputer -Filter "Name -like 'PAW-*'" -Properties Name -ErrorAction SilentlyContinue
+                    Get-ADComputer -Filter "Name -like '*-PAW-*'" -Properties Name -ErrorAction SilentlyContinue
+                    Get-ADComputer -Filter "Description -like '*PAW*'" -Properties Name, Description -ErrorAction SilentlyContinue
+                    Get-ADComputer -Filter "Description -like '*Privileged Access*'" -Properties Name, Description -ErrorAction SilentlyContinue
+                ) | Where-Object { $_ } | Select-Object -Unique -ExpandProperty Name
             }
             catch {
                 @()
@@ -73,7 +103,7 @@ $script:ConfigPath = "$env:ProgramData\ADTierModel\config.json"
 
 #region Core Helper Functions (Must be defined first)
 
-function Ensure-TierDataDirectory {
+function Initialize-TierDataDirectory {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
@@ -133,6 +163,36 @@ function Test-GroupPolicyModuleAvailable {
     }
 }
 
+function Get-EscapedADFilterValue {
+    <#
+    .SYNOPSIS
+        Escapes special characters in AD filter values to prevent LDAP injection.
+    .DESCRIPTION
+        Escapes single quotes, asterisks, parentheses, and backslashes that could
+        be used for LDAP filter injection attacks.
+        IMPORTANT: Backslash must be escaped FIRST to avoid double-escaping.
+    .OUTPUTS
+        Returns the escaped string safe for use in AD filters.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory, ValueFromPipeline)]
+        [AllowEmptyString()]
+        [string]$Value
+    )
+
+    process {
+        if ([string]::IsNullOrEmpty($Value)) {
+            return $Value
+        }
+        # CRITICAL: Escape backslashes FIRST to avoid double-escaping other escaped chars
+        # Then escape NUL character and other special characters for PowerShell AD filter syntax
+        # Per RFC 4515: Must escape *, (, ), \, NUL
+        $Value -replace '\\', '\\\\' -replace '\x00', '\\00' -replace "'", "''" -replace '\*', '`*' -replace '\(', '`(' -replace '\)', '`)'
+    }
+}
+
 function Test-ADGroupExists {
     <#
     .SYNOPSIS
@@ -148,7 +208,8 @@ function Test-ADGroupExists {
     )
 
     try {
-        $group = Get-ADGroup -Filter "Name -eq '$GroupName'" -ErrorAction Stop
+        $escapedName = Get-EscapedADFilterValue -Value $GroupName
+        $group = Get-ADGroup -Filter "Name -eq '$escapedName'" -ErrorAction Stop
         return ($null -ne $group)
     }
     catch {
@@ -175,7 +236,10 @@ function Update-GPOVersion {
         if (Test-Path $gptIniPath) {
             $content = Get-Content $gptIniPath -Raw
             if ($content -match 'Version=(\d+)') {
-                $newVersion = [int]$Matches[1] + 65536
+                # GPO version: High 16 bits = User config, Low 16 bits = Computer config
+                # Security settings are Computer Configuration, so increment low 16 bits
+                # Also increment User config to ensure full propagation
+                $newVersion = [int]$Matches[1] + $script:GPO_COMPUTER_VERSION_INCREMENT + $script:GPO_USER_VERSION_INCREMENT
                 $newContent = $content -replace "Version=\d+", "Version=$newVersion"
                 Set-Content -Path $gptIniPath -Value $newContent -Force
                 Write-Verbose "Updated GPO version to $newVersion"
@@ -185,6 +249,132 @@ function Update-GPOVersion {
     catch {
         Write-Warning "Failed to update GPO version: $_"
     }
+}
+
+function Merge-GptTmplContent {
+    <#
+    .SYNOPSIS
+        Merges new settings into an existing GptTmpl.inf file instead of overwriting.
+    .DESCRIPTION
+        Parses an existing GptTmpl.inf file (if present), merges new settings into it,
+        and returns the merged content. This prevents data loss when multiple functions
+        configure different sections of the same GPO.
+    .PARAMETER GptTmplPath
+        Full path to the GptTmpl.inf file.
+    .PARAMETER NewSettings
+        Hashtable of settings to merge. Keys are section names, values are hashtables of key=value pairs.
+        Example: @{ 'Event Audit' = @{ 'AuditSystemEvents' = '3' }; 'Privilege Rights' = @{ 'SeBackupPrivilege' = '*S-1-5-32-544' } }
+    .OUTPUTS
+        Returns the merged INF content as a string.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)]
+        [string]$GptTmplPath,
+
+        [Parameter(Mandatory)]
+        [hashtable]$NewSettings
+    )
+
+    $existingContent = [ordered]@{}
+    $currentSection = $null
+
+    # Parse existing file if it exists
+    if (Test-Path $GptTmplPath) {
+        try {
+            $lines = Get-Content $GptTmplPath -Encoding Unicode -ErrorAction Stop
+            foreach ($line in $lines) {
+                $trimmedLine = $line.Trim()
+                if ($trimmedLine -match '^\[(.+)\]$') {
+                    $currentSection = $Matches[1]
+                    if (-not $existingContent.Contains($currentSection)) {
+                        $existingContent[$currentSection] = [ordered]@{}
+                    }
+                }
+                elseif ($trimmedLine -match '^([^=]+?)\s*=\s*(.*)$' -and $currentSection) {
+                    $key = $Matches[1].Trim()
+                    $value = $Matches[2].Trim()
+                    $existingContent[$currentSection][$key] = $value
+                }
+            }
+        }
+        catch {
+            Write-Verbose "Could not read existing GptTmpl.inf, creating new: $_"
+        }
+    }
+
+    # Ensure required sections exist with proper values
+    if (-not $existingContent.Contains('Unicode')) {
+        $existingContent['Unicode'] = [ordered]@{ 'Unicode' = 'yes' }
+    }
+    if (-not $existingContent.Contains('Version')) {
+        $existingContent['Version'] = [ordered]@{
+            'signature' = '"$CHICAGO$"'
+            'Revision' = '1'
+        }
+    }
+
+    # Merge new settings into existing content
+    foreach ($section in $NewSettings.Keys) {
+        if (-not $existingContent.Contains($section)) {
+            $existingContent[$section] = [ordered]@{}
+        }
+        foreach ($key in $NewSettings[$section].Keys) {
+            $existingContent[$section][$key] = $NewSettings[$section][$key]
+        }
+    }
+
+    # Build output string - Unicode and Version first, then others
+    $output = [System.Text.StringBuilder]::new()
+
+    # Write sections in order: Unicode, Version, then alphabetically
+    $orderedSections = @('Unicode', 'Version') + ($existingContent.Keys | Where-Object { $_ -notin @('Unicode', 'Version') } | Sort-Object)
+
+    foreach ($section in $orderedSections) {
+        if ($existingContent.Contains($section) -and $existingContent[$section].Count -gt 0) {
+            [void]$output.AppendLine("[$section]")
+            foreach ($key in $existingContent[$section].Keys) {
+                [void]$output.AppendLine("$key = $($existingContent[$section][$key])")
+            }
+        }
+    }
+
+    return $output.ToString()
+}
+
+function Backup-GptTmplFile {
+    <#
+    .SYNOPSIS
+        Creates a timestamped backup of a GptTmpl.inf file before modification.
+    .DESCRIPTION
+        Creates a backup copy of the GptTmpl.inf file to enable recovery if needed.
+    .PARAMETER GptTmplPath
+        Full path to the GptTmpl.inf file to backup.
+    .OUTPUTS
+        Returns the backup file path if successful, $null if no backup needed or failed.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)]
+        [string]$GptTmplPath
+    )
+
+    if (Test-Path $GptTmplPath) {
+        try {
+            $timestamp = Get-Date -Format 'yyyyMMddHHmmss'
+            $backupPath = "$GptTmplPath.$timestamp.bak"
+            Copy-Item -Path $GptTmplPath -Destination $backupPath -Force
+            Write-Verbose "Created backup: $backupPath"
+            return $backupPath
+        }
+        catch {
+            Write-Warning "Failed to create backup of GptTmpl.inf: $_"
+            return $null
+        }
+    }
+    return $null
 }
 
 #endregion
@@ -204,14 +394,14 @@ function Write-TierLog {
     )
 
     $logPath = "$env:ProgramData\ADTierModel\Logs"
-    Ensure-TierDataDirectory -Path $logPath
+    Initialize-TierDataDirectory -Path $logPath
 
     $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
     $logFile = Join-Path $logPath "ADTierModel_$(Get-Date -Format 'yyyyMMdd').log"
     $safeMessage = ($Message -replace '[\r\n]+', ' ').Trim()
 
-    if ($safeMessage.Length -gt 4000) {
-        $safeMessage = $safeMessage.Substring(0, 4000) + '...'
+    if ($safeMessage.Length -gt $script:MAX_LOG_MESSAGE_LENGTH) {
+        $safeMessage = $safeMessage.Substring(0, $script:MAX_LOG_MESSAGE_LENGTH) + '...'
     }
 
     $logEntry = "$timestamp [$Level] [$Component] $safeMessage"
@@ -222,11 +412,21 @@ function Write-TierLog {
         'Info'    { Write-Verbose $Message }
         'Warning' { Write-Warning $Message }
         'Error'   { Write-Error $Message }
-        'Success' { Write-Host $Message -ForegroundColor Green }
+        'Success' { Write-Information $Message -InformationAction Continue }
     }
 }
 
 function Get-ADDomainRootDN {
+    <#
+    .SYNOPSIS
+        Gets the distinguished name of the current AD domain root.
+    .OUTPUTS
+        Returns the domain's distinguished name string.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param()
+
     try {
         $domain = Get-ADDomain -ErrorAction Stop
         return $domain.DistinguishedName
@@ -379,10 +579,14 @@ function Initialize-ADTierModel {
                             
                             foreach ($subOU in $script:StandardSubOUs) {
                                 $subOUPath = "OU=$subOU,$ouPath"
-                                if (-not (Test-ADTierOUExists -OUPath $subOUPath)) {
-                                    New-ADOrganizationalUnit -Name $subOU -Path $ouPath -ProtectedFromAccidentalDeletion $true
+                                # Use try/catch instead of Test-then-Create to avoid TOCTOU race condition
+                                try {
+                                    New-ADOrganizationalUnit -Name $subOU -Path $ouPath -ProtectedFromAccidentalDeletion $true -ErrorAction Stop
                                     $results.OUsCreated += $subOUPath
                                     Write-Verbose "Created sub-OU: $subOUPath"
+                                }
+                                catch [Microsoft.ActiveDirectory.Management.ADIdentityAlreadyExistsException] {
+                                    Write-Verbose "Sub-OU already exists: $subOUPath"
                                 }
                             }
                         }
@@ -423,10 +627,11 @@ function Initialize-ADTierModel {
                 
                 foreach ($template in $groupTemplates) {
                     $groupName = "$tierKey-$($template.Suffix)"
-                    
+
                     if ($PSCmdlet.ShouldProcess($groupName, "Create Security Group")) {
                         try {
-                            $existingGroup = Get-ADGroup -Filter "Name -eq '$groupName'" -ErrorAction SilentlyContinue
+                            $escapedGroupName = Get-EscapedADFilterValue -Value $groupName
+                            $existingGroup = Get-ADGroup -Filter "Name -eq '$escapedGroupName'" -ErrorAction SilentlyContinue
                             
                             if (-not $existingGroup) {
                                 $groupParams = @{
@@ -531,7 +736,7 @@ function Initialize-ADTierModel {
         
         # Save configuration
         $configDir = Split-Path $script:ConfigPath -Parent
-        Ensure-TierDataDirectory -Path $configDir
+        Initialize-TierDataDirectory -Path $configDir
 
         $config = @{
             InitializedDate = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
@@ -640,10 +845,10 @@ function Get-ADTier0Infrastructure {
         $role = $script:Tier0CriticalRoles[$roleKey]
         
         Write-Verbose "Searching for: $($role.Name)"
-        
+
         try {
-            $computers = & $role.Detection
-            
+            $computers = @(& $role.Detection)
+
             foreach ($computerName in $computers) {
                 if ($computerName) {
                     $computer = Get-ADComputer -Identity $computerName -Properties OperatingSystem, Description, LastLogonDate
@@ -667,14 +872,14 @@ function Get-ADTier0Infrastructure {
                 }
             }
             
-            Write-Verbose "Found $($computers.Count) $($role.Name) server(s)"
+            Write-Verbose "Found $(@($computers).Count) $($role.Name) server(s)"
         }
         catch {
             Write-Warning "Failed to detect $($role.Name): $_"
         }
     }
-    
-    Write-TierLog -Message "Discovered $($discovered.Count) Tier 0 infrastructure components" -Level Info -Component 'Discovery'
+
+    Write-TierLog -Message "Discovered $(@($discovered).Count) Tier 0 infrastructure components" -Level Info -Component 'Discovery'
     
     return $discovered
 }
@@ -930,11 +1135,11 @@ function Get-ADTier {
         
         try {
             $ou = Get-ADOrganizationalUnit -Identity $ouPath -Properties Description, ProtectedFromAccidentalDeletion
-            
-            # Get counts
-            $computers = (Get-ADComputer -SearchBase $ouPath -SearchScope Subtree -Filter *).Count
-            $users = (Get-ADUser -SearchBase $ouPath -SearchScope Subtree -Filter *).Count
-            $groups = (Get-ADGroup -SearchBase $ouPath -SearchScope Subtree -Filter *).Count
+
+            # Get counts - wrap in @() to handle single object returns
+            $computers = @(Get-ADComputer -SearchBase $ouPath -SearchScope Subtree -Filter *).Count
+            $users = @(Get-ADUser -SearchBase $ouPath -SearchScope Subtree -Filter *).Count
+            $groups = @(Get-ADGroup -SearchBase $ouPath -SearchScope Subtree -Filter *).Count
             
             $results += [PSCustomObject]@{
                 TierName = $tier
@@ -1173,7 +1378,7 @@ function Get-ADTierMember {
                 SamAccountName = $group.SamAccountName
                 ObjectType = 'Group'
                 Tier = $TierName
-                MemberCount = if ($group.Member) { $group.Member.Count } else { 0 }
+                MemberCount = @($group.Member).Count
                 DistinguishedName = $group.DistinguishedName
             }
         }
@@ -1280,7 +1485,8 @@ function Get-ADTierViolation {
         Write-Verbose "Checking for cross-tier access..."
         
         foreach ($tierKey in $script:TierConfiguration.Keys) {
-            $adminGroup = Get-ADGroup -Filter "Name -eq '$tierKey-Admins'" -ErrorAction SilentlyContinue
+            $escapedTierKey = Get-EscapedADFilterValue -Value "$tierKey-Admins"
+            $adminGroup = Get-ADGroup -Filter "Name -eq '$escapedTierKey'" -ErrorAction SilentlyContinue
 
             if ($adminGroup) {
                 try {
@@ -1321,17 +1527,18 @@ function Get-ADTierViolation {
 
         # Find domain controllers outside Tier0
         try {
-            $domainControllers = @(Get-ADDomainController -Filter * -ErrorAction Stop)
+            $domainControllers = @(Get-ADDomainController -ErrorAction Stop)
         }
         catch {
-            # Fallback: Query Domain Controllers OU directly
+            # Fallback: Query by primaryGroupID (516 = Domain Controllers) - works in all locales
             Write-Verbose "Get-ADDomainController failed, using fallback method: $_"
-            $domainControllers = @(Get-ADComputer -SearchBase "OU=Domain Controllers,$(Get-ADDomainRootDN)" -Filter * -ErrorAction SilentlyContinue)
+            $domainControllers = @(Get-ADComputer -Filter "primaryGroupID -eq $($script:DC_PRIMARY_GROUP_ID)" -ErrorAction SilentlyContinue)
         }
         $tier0OU = "$($script:TierConfiguration['Tier0'].OUPath),$(Get-ADDomainRootDN)"
-        
+
         foreach ($dc in $domainControllers) {
-            $dcComputer = Get-ADComputer -Identity $dc.Name
+            $dcComputer = Get-ADComputer -Identity $dc.Name -ErrorAction SilentlyContinue
+            if (-not $dcComputer) { continue }
             
             if ($dcComputer.DistinguishedName -notlike "*$tier0OU*") {
                 $violations += [PSCustomObject]@{
@@ -1405,7 +1612,8 @@ function Test-ADTierCompliance {
     Write-Verbose "Checking administrative groups..."
     foreach ($tierKey in $script:TierConfiguration.Keys) {
         $groupName = "$tierKey-Admins"
-        $groupExists = Get-ADGroup -Filter "Name -eq '$groupName'" -ErrorAction SilentlyContinue
+        $escapedGroupName = Get-EscapedADFilterValue -Value $groupName
+        $groupExists = Get-ADGroup -Filter "Name -eq '$escapedGroupName'" -ErrorAction SilentlyContinue
         
         $complianceResults.Checks += [PSCustomObject]@{
             CheckName = "Admin Group Exists: $groupName"
@@ -1589,7 +1797,8 @@ function Find-ADCrossTierAccess {
     $adminGroups = @{}
     foreach ($tierKey in $script:TierConfiguration.Keys) {
         $groupName = "$tierKey-Admins"
-        $group = Get-ADGroup -Filter "Name -eq '$groupName'" -ErrorAction SilentlyContinue
+        $escapedGroupName = Get-EscapedADFilterValue -Value $groupName
+        $group = Get-ADGroup -Filter "Name -eq '$escapedGroupName'" -ErrorAction SilentlyContinue
         if ($group) {
             $adminGroups[$tierKey] = Get-ADGroupMember -Identity $group -Recursive
         }
@@ -1602,7 +1811,8 @@ function Find-ADCrossTierAccess {
     foreach ($user in $usersInMultipleTiers) {
         $tiers = @()
         foreach ($tierKey in $adminGroups.Keys) {
-            if ($adminGroups[$tierKey].SamAccountName -contains $user.Name) {
+            # Wrap in @() to handle single-object scenario correctly
+            if (@($adminGroups[$tierKey]).SamAccountName -contains $user.Name) {
                 $tiers += $tierKey
             }
         }
@@ -1643,8 +1853,9 @@ function Find-ADTierMisconfiguration {
     foreach ($tierKey in $script:TierConfiguration.Keys) {
         foreach ($suffix in $requiredGroupSuffixes) {
             $groupName = "$tierKey-$suffix"
-            $group = Get-ADGroup -Filter "Name -eq '$groupName'" -ErrorAction SilentlyContinue
-            
+            $escapedGroupName = Get-EscapedADFilterValue -Value $groupName
+            $group = Get-ADGroup -Filter "Name -eq '$escapedGroupName'" -ErrorAction SilentlyContinue
+
             if (-not $group) {
                 $issues += [PSCustomObject]@{
                     IssueType = 'MissingGroup'
@@ -1872,10 +2083,10 @@ function Get-ADTierOUStructure {
         $ouStructure = @()
         
         foreach ($ou in $ous) {
-            # Count objects in OU
-            $computers = (Get-ADComputer -SearchBase $ou.DistinguishedName -SearchScope OneLevel -Filter *).Count
-            $users = (Get-ADUser -SearchBase $ou.DistinguishedName -SearchScope OneLevel -Filter *).Count
-            $groups = (Get-ADGroup -SearchBase $ou.DistinguishedName -SearchScope OneLevel -Filter *).Count
+            # Count objects in OU - wrap in @() to handle single object returns
+            $computers = @(Get-ADComputer -SearchBase $ou.DistinguishedName -SearchScope OneLevel -Filter *).Count
+            $users = @(Get-ADUser -SearchBase $ou.DistinguishedName -SearchScope OneLevel -Filter *).Count
+            $groups = @(Get-ADGroup -SearchBase $ou.DistinguishedName -SearchScope OneLevel -Filter *).Count
             $totalObjects = $computers + $users + $groups
             
             if ($IncludeEmptyOUs -or $totalObjects -gt 0) {
@@ -1949,8 +2160,9 @@ function New-ADTierGroup {
     
     if ($PSCmdlet.ShouldProcess($GroupName, "Create Security Group")) {
         try {
-            $existingGroup = Get-ADGroup -Filter "Name -eq '$GroupName'" -ErrorAction SilentlyContinue
-            
+            $escapedGroupName = Get-EscapedADFilterValue -Value $GroupName
+            $existingGroup = Get-ADGroup -Filter "Name -eq '$escapedGroupName'" -ErrorAction SilentlyContinue
+
             if (-not $existingGroup) {
                 $groupParams = @{
                     Name = $GroupName
@@ -2031,7 +2243,7 @@ function Get-ADTierGroup {
                 Description = $group.Description
                 GroupScope = $group.GroupScope
                 GroupCategory = $group.GroupCategory
-                MemberCount = if ($group.Member) { $group.Member.Count } else { 0 }
+                MemberCount = @($group.Member).Count
                 DistinguishedName = $group.DistinguishedName
             }
             
@@ -2093,13 +2305,15 @@ function Add-ADTierGroupMember {
     }
 
     try {
-        $group = Get-ADGroup -Filter "Name -eq '$groupName'" -ErrorAction Stop
+        $escapedGroupName = Get-EscapedADFilterValue -Value $groupName
+        $group = Get-ADGroup -Filter "Name -eq '$escapedGroupName'" -ErrorAction Stop
 
         foreach ($member in $Members) {
             if ($PSCmdlet.ShouldProcess($member, "Add to $groupName")) {
                 try {
                     # Check if member exists
-                    $adObject = Get-ADObject -Filter "SamAccountName -eq '$member'" -ErrorAction Stop
+                    $escapedMember = Get-EscapedADFilterValue -Value $member
+                    $adObject = Get-ADObject -Filter "SamAccountName -eq '$escapedMember'" -ErrorAction Stop
                     
                     # Check if already a member
                     $isMember = Get-ADGroupMember -Identity $group | Where-Object { $_.SamAccountName -eq $member }
@@ -2159,10 +2373,11 @@ function Remove-ADTierGroupMember {
     )
     
     $groupName = "$TierName-$GroupSuffix"
-    
+
     try {
-        $group = Get-ADGroup -Filter "Name -eq '$groupName'" -ErrorAction Stop
-        
+        $escapedGroupName = Get-EscapedADFilterValue -Value $groupName
+        $group = Get-ADGroup -Filter "Name -eq '$escapedGroupName'" -ErrorAction Stop
+
         foreach ($member in $Members) {
             if ($PSCmdlet.ShouldProcess($member, "Remove from $groupName")) {
                 try {
@@ -2234,7 +2449,8 @@ function Set-ADTierPermission {
     if ($PSCmdlet.ShouldProcess($tierOUPath, "Configure permissions for $DelegateToGroup")) {
         try {
             # Verify group exists
-            $group = Get-ADGroup -Filter "Name -eq '$DelegateToGroup'" -ErrorAction Stop
+            $escapedDelegateToGroup = Get-EscapedADFilterValue -Value $DelegateToGroup
+            $group = Get-ADGroup -Filter "Name -eq '$escapedDelegateToGroup'" -ErrorAction Stop
             
             # Get the OU object
             $ou = Get-ADOrganizationalUnit -Identity $tierOUPath
@@ -2480,17 +2696,19 @@ function Set-ADTierAuthenticationPolicy {
                 Write-Warning "Authentication Policy cmdlets not available. Requires Windows Server 2012 R2 or later."
                 return
             }
-            
+
             # Create authentication policy
-            $existingPolicy = Get-ADAuthenticationPolicy -Filter "Name -eq '$policyName'" -ErrorAction SilentlyContinue
-            
+            $escapedPolicyName = Get-EscapedADFilterValue -Value $policyName
+            $existingPolicy = Get-ADAuthenticationPolicy -Filter "Name -eq '$escapedPolicyName'" -ErrorAction SilentlyContinue
+
             if (-not $existingPolicy) {
                 New-ADAuthenticationPolicy -Name $policyName -Description "Authentication policy for $TierName"
                 Write-TierLog -Message "Created authentication policy: $policyName" -Level Success -Component 'AuthPolicy'
             }
-            
+
             # Create authentication policy silo
-            $existingSilo = Get-ADAuthenticationPolicySilo -Filter "Name -eq '$siloName'" -ErrorAction SilentlyContinue
+            $escapedSiloName = Get-EscapedADFilterValue -Value $siloName
+            $existingSilo = Get-ADAuthenticationPolicySilo -Filter "Name -eq '$escapedSiloName'" -ErrorAction SilentlyContinue
             
             if (-not $existingSilo) {
                 New-ADAuthenticationPolicySilo -Name $siloName -Description "Authentication silo for $TierName"
@@ -2524,12 +2742,13 @@ function Get-ADTierAuthenticationPolicy {
         Write-Warning "Authentication Policy cmdlets not available."
         return
     }
-    
+
     $policies = @()
-    
+
     foreach ($tierKey in $script:TierConfiguration.Keys) {
         $policyName = "AuthPolicy-$tierKey"
-        $policy = Get-ADAuthenticationPolicy -Filter "Name -eq '$policyName'" -ErrorAction SilentlyContinue
+        $escapedPolicyName = Get-EscapedADFilterValue -Value $policyName
+        $policy = Get-ADAuthenticationPolicy -Filter "Name -eq '$escapedPolicyName'" -ErrorAction SilentlyContinue
         
         if ($policy) {
             $policies += [PSCustomObject]@{
@@ -2570,20 +2789,30 @@ function Set-ADTierPasswordPolicy {
         [Parameter(Mandatory)]
         [ValidateSet('Tier0', 'Tier1', 'Tier2')]
         [string]$TierName,
-        
+
+        [ValidateRange(1, 128)]
         [int]$MinPasswordLength = 15,
+
+        [ValidateRange(0, 24)]
         [int]$PasswordHistoryCount = 24,
+
+        [ValidateRange(1, 999)]
         [int]$MaxPasswordAge = 60,
+
+        [ValidateRange(0, 998)]
         [int]$MinPasswordAge = 1,
+
+        [ValidateRange(0, 999)]
         [int]$LockoutThreshold = 3
     )
-    
+
     $psoName = "PSO-$TierName-Admins"
     $groupName = "$TierName-Admins"
-    
+
     if ($PSCmdlet.ShouldProcess($psoName, "Create Password Settings Object")) {
         try {
-            $existingPSO = Get-ADFineGrainedPasswordPolicy -Filter "Name -eq '$psoName'" -ErrorAction SilentlyContinue
+            $escapedPsoName = Get-EscapedADFilterValue -Value $psoName
+            $existingPSO = Get-ADFineGrainedPasswordPolicy -Filter "Name -eq '$escapedPsoName'" -ErrorAction SilentlyContinue
             
             if (-not $existingPSO) {
                 $tierNumber = switch ($TierName) {
@@ -2604,9 +2833,10 @@ function Set-ADTierPasswordPolicy {
                     -ComplexityEnabled $true `
                     -ReversibleEncryptionEnabled $false `
                     -Description "Enhanced password policy for $TierName administrators"
-                
+
                 # Apply to admin group
-                $group = Get-ADGroup -Filter "Name -eq '$groupName'" -ErrorAction Stop
+                $escapedGroupName = Get-EscapedADFilterValue -Value $groupName
+                $group = Get-ADGroup -Filter "Name -eq '$escapedGroupName'" -ErrorAction Stop
                 if ($group) {
                     Add-ADFineGrainedPasswordPolicySubject -Identity $psoName -Subjects $group
                     Write-TierLog -Message "Created password policy: $psoName" -Level Success -Component 'PasswordPolicy'
@@ -2857,23 +3087,25 @@ function Set-GPOUserRight {
             Write-Warning "No valid identities found for $UserRight"
             return
         }
-        
-        # Build secedit INF content
+
+        # Build settings for merge
         $infPath = "$sysvol\GptTmpl.inf"
         $sidString = $sids -join ','
-        
-        $infContent = @"
-[Unicode]
-Unicode=yes
-[Version]
-signature="`$CHICAGO`$"
-Revision=1
-[Privilege Rights]
-$UserRight = $sidString
-"@
-        
-        # Write INF file
-        Set-Content -Path $infPath -Value $infContent -Encoding Unicode
+
+        # Create backup before modification
+        Backup-GptTmplFile -GptTmplPath $infPath | Out-Null
+
+        # Use merge function to preserve existing settings
+        $newSettings = @{
+            'Privilege Rights' = @{
+                $UserRight = $sidString
+            }
+        }
+
+        $mergedContent = Merge-GptTmplContent -GptTmplPath $infPath -NewSettings $newSettings
+
+        # Write merged INF file
+        $mergedContent | Out-File -FilePath $infPath -Encoding Unicode -Force
 
         # Increment GPO version to trigger replication
         Update-GPOVersion -GPOGuid $gpo.Id
@@ -3074,8 +3306,9 @@ function New-ADTierAdminAccount {
     .PARAMETER Description
         Optional description for the account.
     
-    .PARAMETER NoLockout
-        If specified, excludes this account from lockout policies (use sparingly).
+    .PARAMETER PreventDelegation
+        If specified, sets AccountNotDelegated flag preventing Kerberos delegation.
+        Note: This does NOT prevent account lockout - consider Protected Users group for that.
     
     .PARAMETER Email
         Email address for the account.
@@ -3088,7 +3321,7 @@ function New-ADTierAdminAccount {
         - Created in the Users OU of the specified tier
         - Added to the TierX-Admins group
         - Configured with strong password requirements
-        - Optionally protected from account lockout
+        - Optionally protected from Kerberos delegation
     #>
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -3107,7 +3340,8 @@ function New-ADTierAdminAccount {
         
         [string]$Description,
         
-        [switch]$NoLockout,
+        [Alias('NoLockout')]  # Backward compatibility alias
+        [switch]$PreventDelegation,
         
         [string]$Email
     )
@@ -3131,25 +3365,26 @@ function New-ADTierAdminAccount {
             if (-not (Test-ADTierOUExists -OUPath $usersOU)) {
                 throw "Users OU does not exist: $usersOU. Run Initialize-ADTierModel -CreateOUStructure first."
             }
-            
+
             # Check if account already exists
-            $existingUser = Get-ADUser -Filter "SamAccountName -eq '$Username'" -ErrorAction SilentlyContinue
+            $escapedUsername = Get-EscapedADFilterValue -Value $Username
+            $existingUser = Get-ADUser -Filter "SamAccountName -eq '$escapedUsername'" -ErrorAction SilentlyContinue
             if ($existingUser) {
                 throw "User account already exists: $Username"
             }
             
             if ($PSCmdlet.ShouldProcess($Username, "Create Tier Admin Account")) {
-                
+
                 # Generate secure random password
                 Add-Type -AssemblyName System.Web
                 $password = [System.Web.Security.Membership]::GeneratePassword(24, 8)
                 $securePassword = ConvertTo-SecureString -String $password -AsPlainText -Force
-                
+
                 # Build description
                 if (-not $Description) {
                     $Description = "$($tierConfig.Name) Administrator Account"
                 }
-                
+
                 # Create account parameters
                 $userParams = @{
                     Name = "$FirstName $LastName ($TierName)"
@@ -3165,11 +3400,11 @@ function New-ADTierAdminAccount {
                     CannotChangePassword = $false
                     Description = $Description
                 }
-                
+
                 if ($Email) {
                     $userParams['EmailAddress'] = $Email
                 }
-                
+
                 # Create the user account
                 New-ADUser @userParams
                 Write-TierLog -Message "Created user account: $Username" -Level Success -Component 'AccountManagement'
@@ -3184,21 +3419,24 @@ function New-ADTierAdminAccount {
 
                 Add-ADGroupMember -Identity $adminGroup -Members $Username -ErrorAction Stop
                 Write-TierLog -Message "Added $Username to $adminGroup" -Level Success -Component 'AccountManagement'
-                
-                # Configure lockout protection if requested (sets AccountNotDelegated flag)
-                if ($NoLockout) {
+
+                # Configure AccountNotDelegated if requested
+                # NOTE: This does NOT prevent lockout - it prevents Kerberos delegation
+                if ($PreventDelegation) {
                     Set-ADAccountControl -Identity $Username -AccountNotDelegated $true
-                    Write-TierLog -Message "Configured lockout protection for $Username" -Level Info -Component 'AccountManagement'
-                    Write-Warning "Account $Username is protected from lockout. Use this feature sparingly."
+                    Write-TierLog -Message "Set AccountNotDelegated flag for $Username" -Level Info -Component 'AccountManagement'
+                    Write-Warning "AccountNotDelegated flag set. NOTE: This prevents Kerberos delegation but does NOT prevent account lockout."
+                    Write-Warning "For lockout protection, use Fine-Grained Password Policy or Protected Users group."
                 }
-                
+
                 # Set account as sensitive and cannot be delegated (for Tier 0)
                 if ($TierName -eq 'Tier0') {
                     Set-ADAccountControl -Identity $Username -AccountNotDelegated $true
-                    Write-TierLog -Message "Configured account not delegated for Tier 0 account: $Username" -Level Info -Component 'AccountManagement'
+                    Write-TierLog -Message "Set AccountNotDelegated flag for Tier 0 account: $Username" -Level Info -Component 'AccountManagement'
                 }
-                
-                # Output account details
+
+                # Output account details - SECURITY: Do not include password in output object
+                # Password is returned separately via SecureString for secure handling
                 $accountInfo = [PSCustomObject]@{
                     Username = $Username
                     TierName = $TierName
@@ -3206,19 +3444,23 @@ function New-ADTierAdminAccount {
                     Email = $Email
                     OUPath = $usersOU
                     AdminGroup = $adminGroup
-                    InitialPassword = $password
+                    InitialPasswordSecure = $securePassword  # SecureString, not plain text
                     MustChangePassword = $true
-                    LockoutProtection = $NoLockout
+                    AccountNotDelegated = ($PreventDelegation -or $TierName -eq 'Tier0')
                     Created = Get-Date
                 }
-                
+
                 Write-Host "`n=== Admin Account Created Successfully ===" -ForegroundColor Green
                 Write-Host "Username: $Username" -ForegroundColor Cyan
                 Write-Host "Tier: $TierName" -ForegroundColor Cyan
-                Write-Host "Initial Password: $password" -ForegroundColor Yellow
-                Write-Host "IMPORTANT: Save this password securely. User must change at first logon." -ForegroundColor Red
                 Write-Host "Admin Group: $adminGroup" -ForegroundColor Cyan
-                
+                Write-Host "`nSECURITY NOTICE:" -ForegroundColor Red
+                Write-Host "The initial password is stored in the returned object as 'InitialPasswordSecure' (SecureString)." -ForegroundColor Yellow
+                Write-Host "To retrieve it once for secure delivery to the user:" -ForegroundColor Yellow
+                Write-Host '  $cred = New-Object PSCredential("temp", $result.InitialPasswordSecure)' -ForegroundColor Cyan
+                Write-Host '  $cred.GetNetworkCredential().Password' -ForegroundColor Cyan
+                Write-Host "User must change password at first logon." -ForegroundColor Yellow
+
                 return $accountInfo
             }
         }
@@ -3232,61 +3474,91 @@ function New-ADTierAdminAccount {
 function Set-ADTierAccountLockoutProtection {
     <#
     .SYNOPSIS
-        Configures lockout protection for tier administrative accounts.
-    
+        Configures the "Account is sensitive and cannot be delegated" flag for tier administrative accounts.
+
     .DESCRIPTION
-        Prevents specific administrative accounts from being locked out due to
-        failed password attempts. Use this sparingly and only for critical accounts.
-    
+        Sets the AccountNotDelegated flag on administrative accounts to prevent Kerberos delegation.
+        This is a SECURITY setting that prevents credential delegation attacks, NOT lockout protection.
+
+        IMPORTANT: This function does NOT prevent account lockout from failed password attempts.
+        To truly prevent lockout, you must use one of these approaches:
+        1. Fine-Grained Password Policy (FGPP) with lockout threshold of 0
+        2. Add account to Protected Users group (preferred for Tier 0)
+        3. Configure domain lockout policy (affects all accounts)
+
+        The AccountNotDelegated flag:
+        - Prevents the account's credentials from being forwarded via Kerberos delegation
+        - Helps protect against Pass-the-Ticket and credential forwarding attacks
+        - Is recommended for all Tier 0 administrative accounts
+
     .PARAMETER Identity
-        The user account to protect from lockout.
-    
+        The user account to configure.
+
     .PARAMETER Enable
-        Enable lockout protection (default).
-    
+        Enable the "sensitive account" flag (prevents delegation).
+
     .PARAMETER Disable
-        Disable lockout protection.
-    
+        Disable the "sensitive account" flag (allows delegation).
+
     .EXAMPLE
         Set-ADTierAccountLockoutProtection -Identity "admin-t0" -Enable
-    
+
+        Sets the AccountNotDelegated flag on the admin-t0 account.
+
     .NOTES
-        Lockout protection should only be used for:
+        This function is named for backwards compatibility but primarily configures
+        delegation protection, not lockout protection. For true lockout protection,
+        use Fine-Grained Password Policies or the Protected Users group.
+
+        Recommended for:
+        - Tier 0 administrative accounts
         - Break-glass emergency accounts
-        - Critical service accounts
-        - Tier 0 domain admin accounts (use very sparingly)
+        - Accounts that should never have their credentials delegated
     #>
     [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory, ValueFromPipeline)]
         [string]$Identity,
-        
+
         [switch]$Enable,
         [switch]$Disable
     )
-    
+
     process {
         try {
-            $user = Get-ADUser -Identity $Identity -ErrorAction Stop
-            
-            if ($PSCmdlet.ShouldProcess($Identity, "Configure Lockout Protection")) {
+            $user = Get-ADUser -Identity $Identity -Properties MemberOf -ErrorAction Stop
+
+            if ($PSCmdlet.ShouldProcess($Identity, "Configure AccountNotDelegated flag")) {
                 if ($Disable) {
-                    # Remove lockout protection (clears AccountNotDelegated flag)
+                    # Remove sensitive account flag (allows delegation)
                     Set-ADAccountControl -Identity $Identity -AccountNotDelegated $false
-                    Write-TierLog -Message "Disabled lockout protection for $Identity" -Level Info -Component 'AccountManagement'
-                    Write-Host "Lockout protection disabled for: $Identity" -ForegroundColor Green
+                    Write-TierLog -Message "Cleared AccountNotDelegated flag for $Identity" -Level Info -Component 'AccountManagement'
+                    Write-Host "AccountNotDelegated flag cleared for: $Identity" -ForegroundColor Green
+                    Write-Warning "This account can now have credentials delegated via Kerberos. This is not recommended for Tier 0 accounts."
                 }
                 else {
-                    # Enable lockout protection (NOT_DELEGATED flag)
+                    # Enable sensitive account flag (prevents delegation)
                     Set-ADAccountControl -Identity $Identity -AccountNotDelegated $true
-                    Write-TierLog -Message "Enabled lockout protection for $Identity" -Level Info -Component 'AccountManagement'
-                    Write-Host "Lockout protection enabled for: $Identity" -ForegroundColor Green
-                    Write-Warning "Use lockout protection sparingly. This account will not be locked out due to failed password attempts."
+                    Write-TierLog -Message "Set AccountNotDelegated flag for $Identity" -Level Info -Component 'AccountManagement'
+                    Write-Host "AccountNotDelegated flag set for: $Identity" -ForegroundColor Green
+                    Write-Host "This account's credentials cannot be delegated via Kerberos." -ForegroundColor Cyan
+
+                    # Check if user is in Protected Users group and provide guidance
+                    $protectedUsersGroup = Get-ADGroup -Identity 'Protected Users' -ErrorAction SilentlyContinue
+                    $inProtectedUsers = $false
+                    if ($protectedUsersGroup -and $user.MemberOf) {
+                        $inProtectedUsers = $user.MemberOf -contains $protectedUsersGroup.DistinguishedName
+                    }
+
+                    if (-not $inProtectedUsers) {
+                        Write-Host "`nRECOMMENDATION: For full protection of Tier 0 accounts, also add to Protected Users group:" -ForegroundColor Yellow
+                        Write-Host "  Add-ADGroupMember -Identity 'Protected Users' -Members '$Identity'" -ForegroundColor Yellow
+                    }
                 }
             }
         }
         catch {
-            Write-TierLog -Message "Failed to configure lockout protection: $_" -Level Error -Component 'AccountManagement'
+            Write-TierLog -Message "Failed to configure AccountNotDelegated: $_" -Level Error -Component 'AccountManagement'
             throw
         }
     }
@@ -3351,9 +3623,10 @@ function Get-ADTierAdminAccount {
                     }
                     
                     if ($IncludeDetails) {
-                        $groups = $user.MemberOf | ForEach-Object { 
-                            (Get-ADGroup -Identity $_).Name 
-                        }
+                        $groups = $user.MemberOf | ForEach-Object {
+                            $grp = Get-ADGroup -Identity $_ -ErrorAction SilentlyContinue
+                            if ($grp) { $grp.Name }
+                        } | Where-Object { $_ }
                         $accountInfo | Add-Member -NotePropertyName 'Groups' -NotePropertyValue ($groups -join ', ')
                     }
                     
@@ -3499,8 +3772,8 @@ function Set-ADTierSecurityPolicy {
                     Set-GPOFirewall -GPOName $GPOName -Profile 'Private' -State 'On'
                     Set-GPOFirewall -GPOName $GPOName -Profile 'Public' -State 'On'
                     
-                    # Restrict CD-ROM and Floppy access
-                    Set-GPORegistryValue -GPOName $GPOName -Key 'HKLM\Software\Microsoft\Windows NT\CurrentVersion\Winlogon' -ValueName 'AllocateCDRoms' -Type String -Value '1'
+                    # Restrict CD-ROM and Floppy access (AllocateCDRoms uses DWORD, 1 = Allocate to administrators only)
+                    Set-GPORegistryValue -GPOName $GPOName -Key 'HKLM\Software\Microsoft\Windows NT\CurrentVersion\Winlogon' -ValueName 'AllocateCDRoms' -Type DWord -Value 1
                     
                     Write-Host "Tier 1 security policies configured: High security for server management" -ForegroundColor Green
                 }
@@ -3601,14 +3874,8 @@ function Set-GPOSecurityOption {
             New-Item -Path $sysvolPath -ItemType Directory -Force -ErrorAction Stop | Out-Null
         }
 
-        # Build INF content
-        $infContent = @()
-        $infContent += "[Unicode]"
-        $infContent += "Unicode=yes"
-        $infContent += "[Version]"
-        $infContent += 'signature="$CHICAGO$"'
-        $infContent += "Revision=1"
-        $infContent += "[Registry Values]"
+        # Build settings hashtable for merge
+        $registryValues = @{}
 
         foreach ($setting in $Settings.GetEnumerator()) {
             $regKey = $securityOptionMap[$setting.Key]
@@ -3628,7 +3895,7 @@ function Set-GPOSecurityOption {
                     }
                     default { "4,$($setting.Value)" }
                 }
-                $infContent += "$regKey=$value"
+                $registryValues[$regKey] = $value
                 Write-Verbose "Configured: $($setting.Key) = $($setting.Value)"
             }
             else {
@@ -3637,7 +3904,17 @@ function Set-GPOSecurityOption {
         }
 
         if ($PSCmdlet.ShouldProcess($GPOName, "Configure Security Options")) {
-            Set-Content -Path $infPath -Value ($infContent -join "`r`n") -Encoding Unicode -Force -ErrorAction Stop
+            # Create backup before modification
+            Backup-GptTmplFile -GptTmplPath $infPath | Out-Null
+
+            # Use merge function to preserve existing settings
+            $newSettings = @{
+                'Registry Values' = $registryValues
+            }
+
+            $mergedContent = Merge-GptTmplContent -GptTmplPath $infPath -NewSettings $newSettings
+            $mergedContent | Out-File -FilePath $infPath -Encoding Unicode -Force
+
             Update-GPOVersion -GPOGuid $gpo.Id
             Write-TierLog -Message "Configured security options in GPO: $GPOName" -Level Success -Component 'GPO'
         }
@@ -3732,16 +4009,17 @@ function Set-GPOAuditPolicy {
 
         if ($PSCmdlet.ShouldProcess($GPOName, "Configure Audit Policy: $Category\$SubCategory")) {
             # Create or update audit.csv
+            # Format: Machine Name,Policy Target,Subcategory,Subcategory GUID,Inclusion Setting,Exclusion Setting,Setting Value
             $csvContent = @()
             $csvContent += "Machine Name,Policy Target,Subcategory,Subcategory GUID,Inclusion Setting,Exclusion Setting,Setting Value"
-            $csvContent += ",$subcatGuid,$SubCategory,$subcatGuid,,$settingValue"
+            $csvContent += ",System,$SubCategory,$subcatGuid,,$settingValue,"
 
             # If file exists, merge with existing entries
             if (Test-Path $auditCsvPath) {
                 $existing = Import-Csv $auditCsvPath -ErrorAction SilentlyContinue
                 foreach ($entry in $existing) {
                     if ($entry.'Subcategory GUID' -ne $subcatGuid) {
-                        $csvContent += ",$($entry.'Subcategory GUID'),$($entry.Subcategory),$($entry.'Subcategory GUID'),,$($entry.'Setting Value')"
+                        $csvContent += ",System,$($entry.Subcategory),$($entry.'Subcategory GUID'),,$($entry.'Setting Value'),"
                     }
                 }
             }
@@ -3845,70 +4123,2117 @@ function Set-GPORegistryValue {
 
 #endregion
 
+#region New Functions from Rust Port
+
+# LDAP Matching Rule OID for transitive group membership (nested groups)
+$script:LDAP_MATCHING_RULE_IN_CHAIN = '1.2.840.113556.1.4.1941'
+
+# Well-known RIDs for primary group resolution
+$script:WellKnownRIDs = @{
+    512 = 'Domain Admins'
+    513 = 'Domain Users'
+    514 = 'Domain Guests'
+    515 = 'Domain Computers'
+    516 = 'Domain Controllers'
+    517 = 'Cert Publishers'
+    518 = 'Schema Admins'
+    519 = 'Enterprise Admins'
+    520 = 'Group Policy Creator Owners'
+    521 = 'Read-only Domain Controllers'
+    522 = 'Cloneable Domain Controllers'
+    553 = 'RAS and IAS Servers'
+    571 = 'Allowed RODC Password Replication Group'
+    572 = 'Denied RODC Password Replication Group'
+}
+
+function Get-ADTierCounts {
+    <#
+    .SYNOPSIS
+        Gets the count of objects in each tier.
+
+    .DESCRIPTION
+        Returns the count of users, computers, and groups in each tier OU,
+        plus a count of unassigned objects not in any tier.
+
+    .EXAMPLE
+        Get-ADTierCounts
+
+        Returns:
+        Tier0      : 15
+        Tier1      : 127
+        Tier2      : 892
+        Unassigned : 45
+
+    .OUTPUTS
+        PSCustomObject with Tier0, Tier1, Tier2, and Unassigned counts.
+    #>
+    [CmdletBinding()]
+    [OutputType([PSCustomObject])]
+    param()
+
+    begin {
+        Write-TierLog -Message "Getting tier counts" -Level Info -Component 'TierManagement'
+    }
+
+    process {
+        $domainDN = Get-ADDomainRootDN
+        $counts = @{
+            Tier0 = 0
+            Tier1 = 0
+            Tier2 = 0
+            Unassigned = 0
+        }
+
+        # Count objects in each tier OU
+        foreach ($tierKey in @('Tier0', 'Tier1', 'Tier2')) {
+            $tier = $script:TierConfiguration[$tierKey]
+            $ouPath = "$($tier.OUPath),$domainDN"
+
+            if (Test-ADTierOUExists -OUPath $ouPath) {
+                try {
+                    $objects = Get-ADObject -SearchBase $ouPath -SearchScope Subtree -Filter {
+                        (objectClass -eq 'user') -or (objectClass -eq 'computer') -or (objectClass -eq 'group')
+                    } -ErrorAction Stop
+                    $counts[$tierKey] = @($objects).Count
+                }
+                catch {
+                    Write-Warning "Failed to count objects in $tierKey : $_"
+                    $counts[$tierKey] = 0
+                }
+            }
+        }
+
+        # Count unassigned objects (not in any tier OU)
+        try {
+            $allObjects = Get-ADObject -SearchBase $domainDN -SearchScope Subtree -Filter {
+                (objectClass -eq 'user') -or (objectClass -eq 'computer') -or (objectClass -eq 'group')
+            } -ErrorAction Stop
+
+            $tierOUPatterns = @(
+                "OU=Tier0,$domainDN",
+                "OU=Tier1,$domainDN",
+                "OU=Tier2,$domainDN"
+            )
+
+            $unassignedCount = 0
+            foreach ($obj in $allObjects) {
+                $inTier = $false
+                foreach ($pattern in $tierOUPatterns) {
+                    if ($obj.DistinguishedName -like "*$pattern*") {
+                        $inTier = $true
+                        break
+                    }
+                }
+                if (-not $inTier) {
+                    $unassignedCount++
+                }
+            }
+            $counts.Unassigned = $unassignedCount
+        }
+        catch {
+            Write-Warning "Failed to count unassigned objects: $_"
+        }
+
+        Write-TierLog -Message "Tier counts: Tier0=$($counts.Tier0), Tier1=$($counts.Tier1), Tier2=$($counts.Tier2), Unassigned=$($counts.Unassigned)" -Level Info -Component 'TierManagement'
+
+        [PSCustomObject]$counts
+    }
+}
+
+function Get-ADFSMORoleHolders {
+    <#
+    .SYNOPSIS
+        Discovers all 5 FSMO role holders as Tier 0 infrastructure.
+
+    .DESCRIPTION
+        Queries Active Directory to identify all FSMO (Flexible Single Master Operations)
+        role holders. These servers are critical Tier 0 infrastructure components.
+
+        FSMO Roles discovered:
+        - Schema Master (Forest-level)
+        - Domain Naming Master (Forest-level)
+        - RID Master (Domain-level)
+        - PDC Emulator (Domain-level)
+        - Infrastructure Master (Domain-level)
+
+    .EXAMPLE
+        Get-ADFSMORoleHolders
+
+        Returns FSMO role holder information as Tier0Component objects.
+
+    .OUTPUTS
+        Array of PSCustomObject representing FSMO role holders.
+    #>
+    [CmdletBinding()]
+    [OutputType([PSCustomObject[]])]
+    param()
+
+    begin {
+        Write-TierLog -Message "Discovering FSMO role holders" -Level Info -Component 'Discovery'
+    }
+
+    process {
+        $fsmoComponents = @()
+
+        try {
+            # Get domain and forest information
+            $domain = Get-ADDomain -ErrorAction Stop
+            $forest = Get-ADForest -ErrorAction Stop
+
+            # Domain-level FSMO roles
+            $domainRoles = @{
+                'PDC Emulator' = $domain.PDCEmulator
+                'RID Master' = $domain.RIDMaster
+                'Infrastructure Master' = $domain.InfrastructureMaster
+            }
+
+            # Forest-level FSMO roles
+            $forestRoles = @{
+                'Schema Master' = $forest.SchemaMaster
+                'Domain Naming Master' = $forest.DomainNamingMaster
+            }
+
+            # Process domain roles
+            foreach ($roleName in $domainRoles.Keys) {
+                $serverFQDN = $domainRoles[$roleName]
+                if ($serverFQDN) {
+                    $serverName = $serverFQDN.Split('.')[0]
+
+                    try {
+                        $computer = Get-ADComputer -Identity $serverName -Properties OperatingSystem, Description, LastLogonTimestamp -ErrorAction SilentlyContinue
+
+                        $fsmoComponents += [PSCustomObject]@{
+                            Name = "$serverName ($roleName)"
+                            RoleType = $roleName -replace ' ', ''
+                            OperatingSystem = $computer.OperatingSystem
+                            LastLogon = if ($computer.LastLogonTimestamp) {
+                                [DateTime]::FromFileTime($computer.LastLogonTimestamp).ToString('yyyy-MM-ddTHH:mm:ssZ')
+                            } else { $null }
+                            CurrentOU = ($computer.DistinguishedName -split ',', 2)[1]
+                            IsInTier0 = $computer.DistinguishedName -like '*OU=Domain Controllers*'
+                            DistinguishedName = $computer.DistinguishedName
+                            Description = "FSMO Role: $roleName"
+                        }
+                    }
+                    catch {
+                        Write-Verbose "Could not get details for $serverName : $_"
+                    }
+                }
+            }
+
+            # Process forest roles
+            foreach ($roleName in $forestRoles.Keys) {
+                $serverFQDN = $forestRoles[$roleName]
+                if ($serverFQDN) {
+                    $serverName = $serverFQDN.Split('.')[0]
+
+                    # Check if already added (could be same DC)
+                    if ($fsmoComponents.Name -notcontains "$serverName ($roleName)") {
+                        try {
+                            $computer = Get-ADComputer -Identity $serverName -Properties OperatingSystem, Description, LastLogonTimestamp -ErrorAction SilentlyContinue
+
+                            $fsmoComponents += [PSCustomObject]@{
+                                Name = "$serverName ($roleName)"
+                                RoleType = $roleName -replace ' ', ''
+                                OperatingSystem = $computer.OperatingSystem
+                                LastLogon = if ($computer.LastLogonTimestamp) {
+                                    [DateTime]::FromFileTime($computer.LastLogonTimestamp).ToString('yyyy-MM-ddTHH:mm:ssZ')
+                                } else { $null }
+                                CurrentOU = ($computer.DistinguishedName -split ',', 2)[1]
+                                IsInTier0 = $computer.DistinguishedName -like '*OU=Domain Controllers*'
+                                DistinguishedName = $computer.DistinguishedName
+                                Description = "FSMO Role: $roleName"
+                            }
+                        }
+                        catch {
+                            Write-Verbose "Could not get details for $serverName : $_"
+                        }
+                    }
+                }
+            }
+
+            Write-TierLog -Message "Found $($fsmoComponents.Count) FSMO role holders" -Level Success -Component 'Discovery'
+        }
+        catch {
+            Write-TierLog -Message "Failed to discover FSMO roles: $_" -Level Error -Component 'Discovery'
+            throw
+        }
+
+        $fsmoComponents
+    }
+}
+
+function Test-ADConnection {
+    <#
+    .SYNOPSIS
+        Comprehensive AD connection testing with step-by-step diagnostics.
+
+    .DESCRIPTION
+        Tests the connection to Active Directory and returns detailed diagnostic
+        information about each step of the connection process. Useful for
+        troubleshooting connectivity issues.
+
+    .EXAMPLE
+        Test-ADConnection
+
+        Returns diagnostic information about AD connectivity.
+
+    .OUTPUTS
+        PSCustomObject with diagnostic information.
+    #>
+    [CmdletBinding()]
+    [OutputType([PSCustomObject])]
+    param()
+
+    begin {
+        Write-TierLog -Message "Starting AD connection diagnostics" -Level Info -Component 'Diagnostics'
+    }
+
+    process {
+        $diagnostics = [PSCustomObject]@{
+            DomainDN = ''
+            ModuleStatus = 'Not checked'
+            DomainConnectivity = 'Not checked'
+            LdapSearchStatus = 'Not checked'
+            ObjectsFound = 0
+            ErrorCode = $null
+            ErrorMessage = $null
+            StepsCompleted = [System.Collections.ArrayList]@()
+            TierOUStatus = [System.Collections.ArrayList]@()
+        }
+
+        # Step 1: Check ActiveDirectory module
+        $null = $diagnostics.StepsCompleted.Add("Checking ActiveDirectory module...")
+        if (Get-Module -Name ActiveDirectory -ListAvailable) {
+            $diagnostics.ModuleStatus = 'OK - Module available'
+            $null = $diagnostics.StepsCompleted.Add("ActiveDirectory module: Available")
+        }
+        else {
+            $diagnostics.ModuleStatus = 'FAILED - Module not found'
+            $diagnostics.ErrorMessage = 'ActiveDirectory module not installed. Install RSAT tools.'
+            $null = $diagnostics.StepsCompleted.Add("ActiveDirectory module: NOT FOUND")
+            return $diagnostics
+        }
+
+        # Step 2: Test domain connectivity
+        $null = $diagnostics.StepsCompleted.Add("Testing domain connectivity...")
+        try {
+            $domain = Get-ADDomain -ErrorAction Stop
+            $diagnostics.DomainDN = $domain.DistinguishedName
+            $diagnostics.DomainConnectivity = 'OK - Connected to ' + $domain.DNSRoot
+            $null = $diagnostics.StepsCompleted.Add("Domain connectivity: OK ($($domain.DNSRoot))")
+        }
+        catch {
+            $diagnostics.DomainConnectivity = 'FAILED'
+            $diagnostics.ErrorMessage = "Cannot connect to domain: $_"
+            $null = $diagnostics.StepsCompleted.Add("Domain connectivity: FAILED - $_")
+            return $diagnostics
+        }
+
+        # Step 3: Test LDAP search
+        $null = $diagnostics.StepsCompleted.Add("Testing LDAP search...")
+        try {
+            $testObjects = Get-ADObject -SearchBase $diagnostics.DomainDN -SearchScope Base -Filter * -ErrorAction Stop
+            $diagnostics.ObjectsFound = @($testObjects).Count
+            $diagnostics.LdapSearchStatus = "OK - Found $($diagnostics.ObjectsFound) object(s)"
+            $null = $diagnostics.StepsCompleted.Add("LDAP search: OK")
+        }
+        catch {
+            $diagnostics.LdapSearchStatus = 'FAILED'
+            $diagnostics.ErrorMessage = "LDAP search failed: $_"
+            $null = $diagnostics.StepsCompleted.Add("LDAP search: FAILED - $_")
+        }
+
+        # Step 4: Test Tier OU existence
+        $null = $diagnostics.StepsCompleted.Add("Testing Tier OU existence...")
+        foreach ($tierKey in @('Tier0', 'Tier1', 'Tier2')) {
+            $tier = $script:TierConfiguration[$tierKey]
+            $ouPath = "$($tier.OUPath),$($diagnostics.DomainDN)"
+
+            $status = [PSCustomObject]@{
+                Tier = $tierKey
+                OUPath = $ouPath
+                Exists = $false
+                ObjectCount = 0
+                Error = $null
+            }
+
+            try {
+                if (Test-ADTierOUExists -OUPath $ouPath) {
+                    $status.Exists = $true
+                    $objects = Get-ADObject -SearchBase $ouPath -SearchScope Subtree -Filter * -ErrorAction SilentlyContinue
+                    $status.ObjectCount = @($objects).Count
+                }
+            }
+            catch {
+                $status.Error = $_.Exception.Message
+            }
+
+            $null = $diagnostics.TierOUStatus.Add($status)
+        }
+        $null = $diagnostics.StepsCompleted.Add("Tier OU tests completed")
+
+        Write-TierLog -Message "AD connection diagnostics completed" -Level Success -Component 'Diagnostics'
+        $diagnostics
+    }
+}
+
+function Get-ADTransitiveGroupMembership {
+    <#
+    .SYNOPSIS
+        Gets all nested group memberships using LDAP_MATCHING_RULE_IN_CHAIN.
+
+    .DESCRIPTION
+        Uses the LDAP matching rule OID 1.2.840.113556.1.4.1941 to find all groups
+        an object belongs to, including through nested group membership. This is
+        significantly more efficient than recursive queries.
+
+    .PARAMETER Identity
+        The distinguished name, SID, GUID, or SAM account name of the object.
+
+    .EXAMPLE
+        Get-ADTransitiveGroupMembership -Identity 'john.doe'
+
+        Returns all groups (direct and nested) that john.doe is a member of.
+
+    .OUTPUTS
+        Array of PSCustomObject representing group memberships.
+    #>
+    [CmdletBinding()]
+    [OutputType([PSCustomObject[]])]
+    param(
+        [Parameter(Mandatory, ValueFromPipeline, ValueFromPipelineByPropertyName)]
+        [Alias('DistinguishedName', 'DN', 'SamAccountName')]
+        [string]$Identity
+    )
+
+    begin {
+        Write-TierLog -Message "Getting transitive group membership" -Level Info -Component 'GroupManagement'
+    }
+
+    process {
+        $memberships = @()
+
+        try {
+            # Resolve identity to DN
+            $adObject = Get-ADObject -Identity $Identity -Properties memberOf, primaryGroupID -ErrorAction Stop
+            $objectDN = $adObject.DistinguishedName
+            $domainDN = ($objectDN -split ',DC=' | Select-Object -Skip 1) -join ',DC='
+            $domainDN = "DC=$domainDN"
+
+            # Get direct memberOf
+            $directGroups = @()
+            if ($adObject.memberOf) {
+                $directGroups = @($adObject.memberOf)
+            }
+
+            # Use LDAP_MATCHING_RULE_IN_CHAIN for transitive membership
+            # Filter: (member:1.2.840.113556.1.4.1941:=<objectDN>)
+            # Escape all LDAP special characters: \ * ( ) / NUL
+            $escapedDN = $objectDN -replace '\\', '\5c' -replace '\*', '\2a' -replace '\(', '\28' -replace '\)', '\29' -replace '\/', '\2f' -replace '\x00', '\00'
+            $filter = "(member:$($script:LDAP_MATCHING_RULE_IN_CHAIN):=$escapedDN)"
+
+            $transitiveGroups = Get-ADGroup -LDAPFilter $filter -Properties GroupScope, GroupCategory -ErrorAction SilentlyContinue
+
+            # Also resolve primary group
+            if ($adObject.primaryGroupID) {
+                $primaryGroup = Resolve-ADPrimaryGroup -PrimaryGroupID $adObject.primaryGroupID
+                if ($primaryGroup) {
+                    $memberships += $primaryGroup
+                }
+            }
+
+            # Add all groups found
+            $allGroupDNs = @()
+            $allGroupDNs += $directGroups
+            if ($transitiveGroups) {
+                $allGroupDNs += $transitiveGroups.DistinguishedName
+            }
+            $allGroupDNs = $allGroupDNs | Select-Object -Unique
+
+            foreach ($groupDN in $allGroupDNs) {
+                try {
+                    $group = Get-ADGroup -Identity $groupDN -Properties GroupScope, GroupCategory, Description -ErrorAction SilentlyContinue
+                    if ($group) {
+                        # Determine tier from group DN or name
+                        $tier = $null
+                        if ($groupDN -like '*OU=Tier0*' -or $group.Name -like 'Tier0-*') { $tier = 'Tier0' }
+                        elseif ($groupDN -like '*OU=Tier1*' -or $group.Name -like 'Tier1-*') { $tier = 'Tier1' }
+                        elseif ($groupDN -like '*OU=Tier2*' -or $group.Name -like 'Tier2-*') { $tier = 'Tier2' }
+
+                        $memberships += [PSCustomObject]@{
+                            GroupName = $group.Name
+                            GroupDN = $group.DistinguishedName
+                            Tier = $tier
+                            GroupType = "$($group.GroupScope) $($group.GroupCategory)"
+                            IsDirect = $directGroups -contains $groupDN
+                        }
+                    }
+                }
+                catch {
+                    Write-Verbose "Could not get group details for $groupDN : $_"
+                }
+            }
+
+            Write-TierLog -Message "Found $($memberships.Count) group memberships for $Identity" -Level Info -Component 'GroupManagement'
+        }
+        catch {
+            Write-TierLog -Message "Failed to get transitive group membership for $Identity : $_" -Level Error -Component 'GroupManagement'
+            throw
+        }
+
+        $memberships
+    }
+}
+
+function Resolve-ADPrimaryGroup {
+    <#
+    .SYNOPSIS
+        Resolves a primary group RID to its distinguished name.
+
+    .DESCRIPTION
+        Converts a primary group ID (RID) to the full distinguished name of the group.
+        Uses well-known RID mappings for standard groups and LDAP queries for custom groups.
+
+    .PARAMETER PrimaryGroupID
+        The primary group RID to resolve.
+
+    .EXAMPLE
+        Resolve-ADPrimaryGroup -PrimaryGroupID 513
+
+        Returns the DN for "Domain Users" group.
+
+    .OUTPUTS
+        PSCustomObject representing the primary group, or $null if not found.
+    #>
+    [CmdletBinding()]
+    [OutputType([PSCustomObject])]
+    param(
+        [Parameter(Mandatory)]
+        [int]$PrimaryGroupID
+    )
+
+    process {
+        $domainDN = Get-ADDomainRootDN
+        $groupName = $null
+        $groupDN = $null
+
+        # Check well-known RIDs
+        if ($script:WellKnownRIDs.ContainsKey($PrimaryGroupID)) {
+            $groupName = $script:WellKnownRIDs[$PrimaryGroupID]
+
+            try {
+                $escapedGroupName = Get-EscapedADFilterValue -Value $groupName
+                $group = Get-ADGroup -Filter "Name -eq '$escapedGroupName'" -ErrorAction SilentlyContinue
+                if ($group) {
+                    $groupDN = $group.DistinguishedName
+                }
+            }
+            catch {
+                Write-Verbose "Could not find well-known group $groupName : $_"
+            }
+        }
+        else {
+            # Search for custom group by primaryGroupToken
+            try {
+                $group = Get-ADGroup -LDAPFilter "(primaryGroupToken=$PrimaryGroupID)" -ErrorAction SilentlyContinue
+                if ($group) {
+                    $groupName = $group.Name
+                    $groupDN = $group.DistinguishedName
+                }
+            }
+            catch {
+                Write-Verbose "Could not find group with primaryGroupToken $PrimaryGroupID : $_"
+            }
+        }
+
+        if ($groupDN) {
+            [PSCustomObject]@{
+                GroupName = $groupName
+                GroupDN = $groupDN
+                Tier = $null
+                GroupType = 'Primary Group'
+                IsDirect = $true
+            }
+        }
+        else {
+            $null
+        }
+    }
+}
+
+function Get-ADLargeGroupMembers {
+    <#
+    .SYNOPSIS
+        Retrieves members from groups with more than 1500 members using ranged retrieval.
+
+    .DESCRIPTION
+        Active Directory limits multi-valued attributes like 'member' to MaxValRange (typically 1500).
+        This function uses ranged attribute retrieval to get all members from large groups.
+
+    .PARAMETER GroupIdentity
+        The distinguished name, SID, GUID, or SAM account name of the group.
+
+    .PARAMETER IncludeNested
+        If specified, includes members from nested groups (transitive membership).
+
+    .EXAMPLE
+        Get-ADLargeGroupMembers -GroupIdentity 'Domain Users'
+
+        Returns all members of the Domain Users group, even if > 1500.
+
+    .EXAMPLE
+        Get-ADLargeGroupMembers -GroupIdentity 'All-Staff' -IncludeNested
+
+        Returns all direct and nested members.
+
+    .OUTPUTS
+        Array of PSCustomObject representing group members.
+    #>
+    [CmdletBinding()]
+    [OutputType([PSCustomObject[]])]
+    param(
+        [Parameter(Mandatory, ValueFromPipeline)]
+        [string]$GroupIdentity,
+
+        [switch]$IncludeNested
+    )
+
+    begin {
+        Write-TierLog -Message "Getting large group members" -Level Info -Component 'GroupManagement'
+        $rangeSize = 1500
+    }
+
+    process {
+        # Use List for better performance with large groups
+        $members = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+        try {
+            # Resolve group to DN
+            $group = Get-ADGroup -Identity $GroupIdentity -ErrorAction Stop
+            $groupDN = $group.DistinguishedName
+            $domainDN = ($groupDN -split ',DC=' | Select-Object -Skip 1) -join ',DC='
+            $domainDN = "DC=$domainDN"
+
+            if ($IncludeNested) {
+                # Use LDAP_MATCHING_RULE_IN_CHAIN for transitive members
+                # Escape all LDAP special characters: \ * ( ) / NUL - backslash FIRST
+                $escapedDN = $groupDN -replace '\\', '\5c' -replace '\*', '\2a' -replace '\(', '\28' -replace '\)', '\29' -replace '\/', '\2f' -replace '\x00', '\00'
+                $filter = "(memberOf:$($script:LDAP_MATCHING_RULE_IN_CHAIN):=$escapedDN)"
+
+                $nestedMembers = Get-ADObject -LDAPFilter $filter -Properties objectClass, userAccountControl, Name, SamAccountName -ErrorAction SilentlyContinue
+
+                # Add null check after SilentlyContinue
+                if ($nestedMembers) {
+                    foreach ($member in $nestedMembers) {
+                        $objectType = 'Unknown'
+                        if ($member.objectClass -contains 'user') { $objectType = 'User' }
+                        elseif ($member.objectClass -contains 'computer') { $objectType = 'Computer' }
+                        elseif ($member.objectClass -contains 'group') { $objectType = 'Group' }
+
+                        $enabled = $true
+                        if ($member.userAccountControl) {
+                            $enabled = -not (($member.userAccountControl -band 2) -eq 2)
+                        }
+
+                        $members.Add([PSCustomObject]@{
+                            Name = $member.Name
+                            SamAccountName = $member.SamAccountName
+                            DistinguishedName = $member.DistinguishedName
+                            ObjectType = $objectType
+                            Enabled = $enabled
+                        })
+                    }
+                }
+            }
+            else {
+                # Direct members only with ranged retrieval
+                $rangeStart = 0
+                $moreMembers = $true
+                $allMemberDNs = [System.Collections.Generic.List[string]]::new()
+
+                while ($moreMembers) {
+                    $rangeEnd = $rangeStart + $rangeSize - 1
+                    $rangeAttr = "member;range=$rangeStart-$rangeEnd"
+
+                    try {
+                        # Use DirectorySearcher for ranged retrieval
+                        $searcher = New-Object System.DirectoryServices.DirectorySearcher
+                        $searcher.SearchRoot = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$groupDN")
+                        $searcher.Filter = "(objectClass=group)"
+                        $searcher.PropertiesToLoad.Add($rangeAttr) | Out-Null
+                        $searcher.PropertiesToLoad.Add("member") | Out-Null
+                        $searcher.SearchScope = [System.DirectoryServices.SearchScope]::Base
+
+                        $result = $searcher.FindOne()
+
+                        if ($result) {
+                            $foundMembers = $false
+
+                            # Check for ranged attribute
+                            foreach ($propName in $result.Properties.PropertyNames) {
+                                if ($propName -like 'member;range=*') {
+                                    $memberValues = $result.Properties[$propName]
+                                    if ($memberValues.Count -gt 0) {
+                                        $foundMembers = $true
+                                        # Use AddRange for better performance
+                                        foreach ($mv in $memberValues) {
+                                            $allMemberDNs.Add($mv)
+                                        }
+
+                                        # Check if this is the last range
+                                        # Ranged attributes look like: member;range=0-1499 (more) or member;range=1500-* (last)
+                                        # If it ends with '*', this is the last batch
+                                        # Use regex -match for reliable asterisk detection
+                                        if ($propName -match '-\*$') {
+                                            $moreMembers = $false
+                                        }
+                                        else {
+                                            $moreMembers = $true
+                                        }
+                                    }
+                                    break
+                                }
+                            }
+
+                            # Check regular member attribute if no ranged attribute found
+                            if (-not $foundMembers -and $result.Properties['member']) {
+                                foreach ($mv in $result.Properties['member']) {
+                                    $allMemberDNs.Add($mv)
+                                }
+                                $moreMembers = $false
+                            }
+                            elseif (-not $foundMembers) {
+                                $moreMembers = $false
+                            }
+                        }
+                        else {
+                            $moreMembers = $false
+                        }
+
+                        $rangeStart += $rangeSize
+
+                        # Safety limit to prevent infinite loops
+                        if ($rangeStart -gt $script:SAFETY_LIMIT_ITERATIONS) {
+                            Write-Warning "Hit safety limit during ranged retrieval"
+                            $moreMembers = $false
+                        }
+                    }
+                    catch {
+                        Write-Verbose "Ranged retrieval error at range $rangeStart : $_"
+                        $moreMembers = $false
+                    }
+                }
+
+                # Batch fetch member details
+                $batchSize = 100
+                for ($i = 0; $i -lt $allMemberDNs.Count; $i += $batchSize) {
+                    $endIndex = [Math]::Min($i + $batchSize - 1, $allMemberDNs.Count - 1)
+                    # Use GetRange for List instead of array slicing
+                    $batch = $allMemberDNs.GetRange($i, $endIndex - $i + 1)
+
+                    foreach ($memberDN in $batch) {
+                        try {
+                            $member = Get-ADObject -Identity $memberDN -Properties objectClass, userAccountControl, Name, SamAccountName -ErrorAction SilentlyContinue
+                            if ($member) {
+                                $objectType = 'Unknown'
+                                if ($member.objectClass -contains 'user') { $objectType = 'User' }
+                                elseif ($member.objectClass -contains 'computer') { $objectType = 'Computer' }
+                                elseif ($member.objectClass -contains 'group') { $objectType = 'Group' }
+
+                                $enabled = $true
+                                if ($member.userAccountControl) {
+                                    $enabled = -not (($member.userAccountControl -band 2) -eq 2)
+                                }
+
+                                $members.Add([PSCustomObject]@{
+                                    Name = $member.Name
+                                    SamAccountName = $member.SamAccountName
+                                    DistinguishedName = $member.DistinguishedName
+                                    ObjectType = $objectType
+                                    Enabled = $enabled
+                                })
+                            }
+                        }
+                        catch {
+                            Write-Verbose "Could not get member details for $memberDN : $_"
+                        }
+                    }
+                }
+            }
+
+            Write-TierLog -Message "Retrieved $($members.Count) members from $($group.Name)" -Level Success -Component 'GroupManagement'
+        }
+        catch {
+            Write-TierLog -Message "Failed to get group members for $GroupIdentity : $_" -Level Error -Component 'GroupManagement'
+            throw
+        }
+
+        $members
+    }
+}
+
+function Get-ADTierComplianceScore {
+    <#
+    .SYNOPSIS
+        Calculates compliance score (0-100) with mathematical deductions.
+
+    .DESCRIPTION
+        Evaluates the AD tier model compliance and returns a score from 0-100.
+        Deductions are applied based on violation severity:
+        - Critical: -10 points each
+        - High: -5 points each
+        - Medium: -2 points each
+        - Low: -1 point each
+
+    .PARAMETER StaleThresholdDays
+        Number of days without logon to consider an account stale. Default: 90.
+
+    .EXAMPLE
+        Get-ADTierComplianceScore
+
+        Returns compliance status with score and violation details.
+
+    .OUTPUTS
+        PSCustomObject with Score, Violations, and summary counts.
+    #>
+    [CmdletBinding()]
+    [OutputType([PSCustomObject])]
+    param(
+        [int]$StaleThresholdDays = 90
+    )
+
+    begin {
+        Write-TierLog -Message "Calculating compliance score" -Level Info -Component 'Compliance'
+    }
+
+    process {
+        $status = [PSCustomObject]@{
+            Score = 100
+            TotalViolations = 0
+            CriticalCount = 0
+            HighCount = 0
+            MediumCount = 0
+            LowCount = 0
+            Violations = @()
+            CrossTierAccess = @()
+            LastChecked = (Get-Date).ToString('yyyy-MM-ddTHH:mm:ssZ')
+        }
+
+        try {
+            # Get existing violations using Test-ADTierCompliance
+            $compliance = Test-ADTierCompliance -ErrorAction SilentlyContinue
+
+            if ($compliance) {
+                # Process compliance results
+                foreach ($check in $compliance.Checks) {
+                    if (-not $check.Passed) {
+                        $severity = switch ($check.Name) {
+                            { $_ -like '*Tier0*' } { 'Critical' }
+                            { $_ -like '*CrossTier*' } { 'Critical' }
+                            { $_ -like '*Permission*' } { 'High' }
+                            { $_ -like '*GPO*' } { 'Medium' }
+                            default { 'Low' }
+                        }
+
+                        $violation = [PSCustomObject]@{
+                            ViolationType = $check.Name
+                            Severity = $severity
+                            ObjectName = $check.Name
+                            Description = $check.Message
+                            Remediation = "Review and correct: $($check.Name)"
+                        }
+
+                        $status.Violations += $violation
+
+                        # Apply score deduction
+                        switch ($severity) {
+                            'Critical' {
+                                $status.Score -= 10
+                                $status.CriticalCount++
+                            }
+                            'High' {
+                                $status.Score -= 5
+                                $status.HighCount++
+                            }
+                            'Medium' {
+                                $status.Score -= 2
+                                $status.MediumCount++
+                            }
+                            'Low' {
+                                $status.Score -= 1
+                                $status.LowCount++
+                            }
+                        }
+                    }
+                }
+            }
+
+            # Check for cross-tier access violations
+            $crossTier = Find-ADCrossTierAccess -ErrorAction SilentlyContinue
+            if ($crossTier) {
+                foreach ($access in $crossTier) {
+                    $status.CrossTierAccess += $access
+                    $status.Violations += [PSCustomObject]@{
+                        ViolationType = 'CrossTierAccess'
+                        Severity = 'Critical'
+                        ObjectName = $access.AccountName
+                        Description = "Account has access to multiple tiers: $($access.Tiers -join ', ')"
+                        Remediation = 'Remove account from groups in all but one tier'
+                    }
+                    $status.Score -= 10
+                    $status.CriticalCount++
+                }
+            }
+
+            # Ensure minimum score of 0
+            if ($status.Score -lt 0) { $status.Score = 0 }
+
+            $status.TotalViolations = $status.Violations.Count
+
+            Write-TierLog -Message "Compliance score: $($status.Score), Violations: $($status.TotalViolations)" -Level Info -Component 'Compliance'
+        }
+        catch {
+            Write-TierLog -Message "Failed to calculate compliance score: $_" -Level Error -Component 'Compliance'
+            throw
+        }
+
+        $status
+    }
+}
+
+function Disable-ADStaleAccounts {
+    <#
+    .SYNOPSIS
+        Bulk disables accounts that haven't logged in for N days.
+
+    .DESCRIPTION
+        Finds all enabled accounts in tier OUs that haven't logged in within
+        the specified threshold and disables them. Supports -WhatIf and -Confirm.
+
+    .PARAMETER StaleThresholdDays
+        Number of days without logon to consider an account stale. Default: 90.
+
+    .PARAMETER TierFilter
+        Optional. Limit to specific tier(s). Default: All tiers.
+
+    .EXAMPLE
+        Disable-ADStaleAccounts -StaleThresholdDays 90 -WhatIf
+
+        Shows which accounts would be disabled without making changes.
+
+    .EXAMPLE
+        Disable-ADStaleAccounts -StaleThresholdDays 180 -TierFilter 'Tier2'
+
+        Disables stale accounts in Tier2 only.
+
+    .OUTPUTS
+        PSCustomObject with success/failure counts and details.
+    #>
+    [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
+    [OutputType([PSCustomObject])]
+    param(
+        [int]$StaleThresholdDays = 90,
+
+        [ValidateSet('Tier0', 'Tier1', 'Tier2')]
+        [string[]]$TierFilter = @('Tier0', 'Tier1', 'Tier2')
+    )
+
+    begin {
+        Write-TierLog -Message "Starting stale account disable operation (threshold: $StaleThresholdDays days)" -Level Info -Component 'Compliance'
+    }
+
+    process {
+        $result = [PSCustomObject]@{
+            SuccessCount = 0
+            FailureCount = 0
+            Disabled = @()
+            Errors = @()
+        }
+
+        $domainDN = Get-ADDomainRootDN
+        $thresholdDate = (Get-Date).AddDays(-$StaleThresholdDays)
+        $thresholdFileTime = $thresholdDate.ToFileTime()
+
+        foreach ($tierKey in $TierFilter) {
+            $tier = $script:TierConfiguration[$tierKey]
+            $ouPath = "$($tier.OUPath),$domainDN"
+
+            if (-not (Test-ADTierOUExists -OUPath $ouPath)) {
+                Write-Verbose "$tierKey OU does not exist, skipping"
+                continue
+            }
+
+            try {
+                # Find enabled users with old lastLogonTimestamp
+                $staleUsers = Get-ADUser -SearchBase $ouPath -SearchScope Subtree -Filter {
+                    Enabled -eq $true -and LastLogonTimestamp -lt $thresholdFileTime
+                } -Properties LastLogonTimestamp, Description -ErrorAction SilentlyContinue
+
+                foreach ($user in $staleUsers) {
+                    $lastLogon = if ($user.LastLogonTimestamp) {
+                        [DateTime]::FromFileTime($user.LastLogonTimestamp)
+                    } else { 'Never' }
+
+                    if ($PSCmdlet.ShouldProcess($user.SamAccountName, "Disable stale account (last logon: $lastLogon)")) {
+                        try {
+                            Disable-ADAccount -Identity $user.DistinguishedName -ErrorAction Stop
+
+                            $result.Disabled += [PSCustomObject]@{
+                                SamAccountName = $user.SamAccountName
+                                DistinguishedName = $user.DistinguishedName
+                                LastLogon = $lastLogon
+                                Tier = $tierKey
+                            }
+                            $result.SuccessCount++
+
+                            Write-TierLog -Message "Disabled stale account: $($user.SamAccountName)" -Level Success -Component 'Compliance'
+                        }
+                        catch {
+                            $result.Errors += "Failed to disable $($user.SamAccountName): $_"
+                            $result.FailureCount++
+                        }
+                    }
+                }
+            }
+            catch {
+                $result.Errors += "Error searching $tierKey : $_"
+            }
+        }
+
+        Write-TierLog -Message "Stale account operation complete: $($result.SuccessCount) disabled, $($result.FailureCount) failed" -Level Info -Component 'Compliance'
+        $result
+    }
+}
+
+function Set-ADServiceAccountHardening {
+    <#
+    .SYNOPSIS
+        Bulk hardens service accounts by setting NOT_DELEGATED flag.
+
+    .DESCRIPTION
+        Sets the 'Account is sensitive and cannot be delegated' flag on service accounts.
+        This prevents Kerberos delegation attacks. Also removes TRUSTED_TO_AUTH_FOR_DELEGATION
+        if present. Targets accounts in ServiceAccounts OUs.
+
+    .PARAMETER Identity
+        Optional. Specific account(s) to harden. If not specified, hardens all
+        service accounts in tier ServiceAccounts OUs.
+
+    .PARAMETER TierFilter
+        Optional. Limit to specific tier(s). Default: All tiers.
+
+    .EXAMPLE
+        Set-ADServiceAccountHardening -WhatIf
+
+        Shows which accounts would be hardened without making changes.
+
+    .EXAMPLE
+        Set-ADServiceAccountHardening -TierFilter 'Tier0', 'Tier1'
+
+        Hardens service accounts in Tier0 and Tier1 only.
+
+    .OUTPUTS
+        PSCustomObject with success/failure counts and details.
+    #>
+    [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'Medium')]
+    [OutputType([PSCustomObject])]
+    param(
+        [string[]]$Identity,
+
+        [ValidateSet('Tier0', 'Tier1', 'Tier2')]
+        [string[]]$TierFilter = @('Tier0', 'Tier1', 'Tier2')
+    )
+
+    begin {
+        Write-TierLog -Message "Starting service account hardening operation" -Level Info -Component 'Compliance'
+
+        # userAccountControl flags
+        $NOT_DELEGATED = 0x100000  # Account is sensitive and cannot be delegated
+        $TRUSTED_TO_AUTH_FOR_DELEGATION = 0x1000000
+    }
+
+    process {
+        $result = [PSCustomObject]@{
+            SuccessCount = 0
+            FailureCount = 0
+            Hardened = @()
+            Errors = @()
+        }
+
+        $domainDN = Get-ADDomainRootDN
+        $accountsToHarden = @()
+
+        if ($Identity) {
+            # Specific accounts provided
+            foreach ($id in $Identity) {
+                try {
+                    $user = Get-ADUser -Identity $id -Properties userAccountControl -ErrorAction Stop
+                    $accountsToHarden += $user
+                }
+                catch {
+                    $result.Errors += "Could not find account $id : $_"
+                }
+            }
+        }
+        else {
+            # Find all service accounts in tier OUs
+            foreach ($tierKey in $TierFilter) {
+                $tier = $script:TierConfiguration[$tierKey]
+                $svcOUPath = "OU=ServiceAccounts,$($tier.OUPath),$domainDN"
+
+                if (Test-ADTierOUExists -OUPath $svcOUPath) {
+                    try {
+                        $svcAccounts = Get-ADUser -SearchBase $svcOUPath -SearchScope OneLevel -Filter * -Properties userAccountControl -ErrorAction SilentlyContinue
+                        $accountsToHarden += $svcAccounts
+                    }
+                    catch {
+                        Write-Verbose "Error searching $svcOUPath : $_"
+                    }
+                }
+            }
+        }
+
+        foreach ($account in $accountsToHarden) {
+            $currentUAC = $account.userAccountControl
+            $isHardened = ($currentUAC -band $NOT_DELEGATED) -eq $NOT_DELEGATED
+            $hasTrustedForDelegation = ($currentUAC -band $TRUSTED_TO_AUTH_FOR_DELEGATION) -eq $TRUSTED_TO_AUTH_FOR_DELEGATION
+
+            if ($isHardened -and -not $hasTrustedForDelegation) {
+                Write-Verbose "$($account.SamAccountName) is already hardened"
+                continue
+            }
+
+            if ($PSCmdlet.ShouldProcess($account.SamAccountName, "Set NOT_DELEGATED flag and remove TRUSTED_TO_AUTH_FOR_DELEGATION")) {
+                try {
+                    # Use Set-ADAccountControl for atomic, race-safe flag manipulation
+                    # This sets desired state directly rather than manipulating bits
+                    Set-ADAccountControl -Identity $account.DistinguishedName `
+                        -AccountNotDelegated $true `
+                        -TrustedToAuthForDelegation $false `
+                        -ErrorAction Stop
+
+                    # Get updated UAC for logging
+                    $updatedAccount = Get-ADUser -Identity $account.DistinguishedName -Properties userAccountControl
+                    $newUAC = $updatedAccount.userAccountControl
+
+                    $result.Hardened += [PSCustomObject]@{
+                        SamAccountName = $account.SamAccountName
+                        DistinguishedName = $account.DistinguishedName
+                        PreviousUAC = $currentUAC
+                        NewUAC = $newUAC
+                    }
+                    $result.SuccessCount++
+
+                    Write-TierLog -Message "Hardened service account: $($account.SamAccountName)" -Level Success -Component 'Compliance'
+                }
+                catch {
+                    $result.Errors += "Failed to harden $($account.SamAccountName): $_"
+                    $result.FailureCount++
+                }
+            }
+        }
+
+        Write-TierLog -Message "Service account hardening complete: $($result.SuccessCount) hardened, $($result.FailureCount) failed" -Level Info -Component 'Compliance'
+        $result
+    }
+}
+
+function Get-ADTierInitializationStatus {
+    <#
+    .SYNOPSIS
+        Checks if the tier model is initialized with detailed status.
+
+    .DESCRIPTION
+        Returns comprehensive status about the tier model initialization including
+        OU existence, group existence, and any missing components.
+
+    .EXAMPLE
+        Get-ADTierInitializationStatus
+
+        Returns initialization status.
+
+    .OUTPUTS
+        PSCustomObject with IsInitialized, OU status, group status, and missing components.
+    #>
+    [CmdletBinding()]
+    [OutputType([PSCustomObject])]
+    param()
+
+    begin {
+        Write-TierLog -Message "Checking tier initialization status" -Level Info -Component 'Initialize'
+    }
+
+    process {
+        $domainDN = Get-ADDomainRootDN
+
+        $status = [PSCustomObject]@{
+            IsInitialized = $true
+            Tier0OUExists = $false
+            Tier1OUExists = $false
+            Tier2OUExists = $false
+            GroupsExist = $false
+            MissingComponents = @()
+        }
+
+        # Check tier OUs
+        foreach ($tierKey in @('Tier0', 'Tier1', 'Tier2')) {
+            $tier = $script:TierConfiguration[$tierKey]
+            $ouPath = "$($tier.OUPath),$domainDN"
+
+            if (Test-ADTierOUExists -OUPath $ouPath) {
+                switch ($tierKey) {
+                    'Tier0' { $status.Tier0OUExists = $true }
+                    'Tier1' { $status.Tier1OUExists = $true }
+                    'Tier2' { $status.Tier2OUExists = $true }
+                }
+
+                # Check sub-OUs
+                foreach ($subOU in $script:StandardSubOUs) {
+                    $subOUPath = "OU=$subOU,$ouPath"
+                    if (-not (Test-ADTierOUExists -OUPath $subOUPath)) {
+                        $status.MissingComponents += "Missing sub-OU: $subOUPath"
+                        $status.IsInitialized = $false
+                    }
+                }
+            }
+            else {
+                $status.MissingComponents += "Missing tier OU: $ouPath"
+                $status.IsInitialized = $false
+            }
+        }
+
+        # Check groups
+        $allGroupsExist = $true
+        $groupSuffixes = @('Admins', 'Operators', 'Readers', 'ServiceAccounts', 'JumpServers')
+
+        foreach ($tierKey in @('Tier0', 'Tier1', 'Tier2')) {
+            foreach ($suffix in $groupSuffixes) {
+                $groupName = "$tierKey-$suffix"
+                if (-not (Test-ADGroupExists -GroupName $groupName)) {
+                    $status.MissingComponents += "Missing group: $groupName"
+                    $allGroupsExist = $false
+                    $status.IsInitialized = $false
+                }
+            }
+        }
+
+        $status.GroupsExist = $allGroupsExist
+
+        Write-TierLog -Message "Initialization status: IsInitialized=$($status.IsInitialized), Missing=$($status.MissingComponents.Count)" -Level Info -Component 'Initialize'
+        $status
+    }
+}
+
+#endregion
+
+#region Endpoint Protection GPO Functions
+
+function Get-ADEndpointProtectionStatus {
+    <#
+    .SYNOPSIS
+        Gets status of all endpoint protection GPOs.
+
+    .DESCRIPTION
+        Returns the status of all endpoint protection GPOs including:
+        - AuditBaseline (per-tier)
+        - AuditEnhanced (per-tier)
+        - DcAuditEssential (DC OU only)
+        - DcAuditComprehensive (DC OU only)
+        - DefenderProtection (domain-wide)
+
+    .EXAMPLE
+        Get-ADEndpointProtectionStatus
+
+        Returns status of all endpoint protection GPOs.
+
+    .OUTPUTS
+        Array of PSCustomObject with GPO status information.
+    #>
+    [CmdletBinding()]
+    [OutputType([PSCustomObject[]])]
+    param()
+
+    begin {
+        Write-TierLog -Message "Getting endpoint protection GPO status" -Level Info -Component 'GPO'
+
+        # Check module availability - set flag for process block
+        $script:GPModuleAvailable = Test-GroupPolicyModuleAvailable
+        if (-not $script:GPModuleAvailable) {
+            Write-Warning "GroupPolicy module not available. Install RSAT tools."
+        }
+    }
+
+    process {
+        # Early exit if GroupPolicy module not available
+        if (-not $script:GPModuleAvailable) {
+            return @()
+        }
+
+        $statuses = @()
+        $domainDN = Get-ADDomainRootDN
+
+        # Define GPO types - names must match those created by New-AD*GPO functions
+        $gpoTypes = @(
+            @{ Type = 'Audit-Baseline'; Description = 'Microsoft recommended baseline audit policies'; Scope = 'per-tier' }
+            @{ Type = 'Audit-Enhanced'; Description = 'ACSC/NSA hardened audit with PowerShell logging'; Scope = 'per-tier' }
+            @{ Type = 'DC-Audit-Essential'; Description = 'Essential security audit for Domain Controllers'; Scope = 'dc-only' }
+            @{ Type = 'DC-Audit-Comprehensive'; Description = 'Comprehensive forensic audit for Domain Controllers'; Scope = 'dc-only' }
+            @{ Type = 'DefenderProtection'; Description = 'Microsoft Defender Antivirus balanced protection'; Scope = 'domain-wide' }
+        )
+
+        foreach ($gpoType in $gpoTypes) {
+            switch ($gpoType.Scope) {
+                'per-tier' {
+                    $tierStatuses = @()
+                    $anyExists = $false
+                    $anyLinked = $false
+
+                    foreach ($tierKey in @('Tier0', 'Tier1', 'Tier2')) {
+                        $gpoName = "SEC-$tierKey-$($gpoType.Type)"
+                        $targetOU = "$($script:TierConfiguration[$tierKey].OUPath),$domainDN"
+
+                        $gpo = Get-GPO -Name $gpoName -ErrorAction SilentlyContinue
+                        $linked = $false
+                        $linkEnabled = $false
+
+                        if ($gpo) {
+                            $anyExists = $true
+                            try {
+                                $links = (Get-GPInheritance -Target $targetOU -ErrorAction SilentlyContinue).GpoLinks
+                                $link = $links | Where-Object { $_.DisplayName -eq $gpoName }
+                                if ($link) {
+                                    $linked = $true
+                                    $linkEnabled = $link.Enabled
+                                    $anyLinked = $true
+                                }
+                            }
+                            catch {
+                                Write-Verbose "Failed to get GPO links for $gpoName at $targetOU : $_"
+                            }
+                        }
+
+                        $tierStatuses += [PSCustomObject]@{
+                            Tier = $tierKey
+                            Linked = $linked
+                            LinkEnabled = $linkEnabled
+                        }
+                    }
+
+                    $statuses += [PSCustomObject]@{
+                        GpoType = $gpoType.Type
+                        Name = "SEC-{Tier}-$($gpoType.Type)"
+                        Description = $gpoType.Description
+                        Exists = $anyExists
+                        Linked = $anyLinked
+                        LinkTarget = 'Per-Tier OUs'
+                        LinkScope = $gpoType.Scope
+                        TierStatus = $tierStatuses
+                    }
+                }
+
+                'dc-only' {
+                    $gpoName = "SEC-$($gpoType.Type)"
+                    $dcOU = "OU=Domain Controllers,$domainDN"
+
+                    $gpo = Get-GPO -Name $gpoName -ErrorAction SilentlyContinue
+                    $linked = $false
+                    $linkEnabled = $false
+                    $created = $null
+                    $modified = $null
+
+                    if ($gpo) {
+                        $created = $gpo.CreationTime.ToString('o')
+                        $modified = $gpo.ModificationTime.ToString('o')
+
+                        try {
+                            $links = (Get-GPInheritance -Target $dcOU -ErrorAction SilentlyContinue).GpoLinks
+                            $link = $links | Where-Object { $_.DisplayName -eq $gpoName }
+                            if ($link) {
+                                $linked = $true
+                                $linkEnabled = $link.Enabled
+                            }
+                        }
+                        catch {
+                            Write-Verbose "Failed to get GPO links for $gpoName at $dcOU : $_"
+                        }
+                    }
+
+                    $statuses += [PSCustomObject]@{
+                        GpoType = $gpoType.Type
+                        Name = $gpoName
+                        Description = $gpoType.Description
+                        Exists = ($null -ne $gpo)
+                        Linked = $linked
+                        LinkEnabled = $linkEnabled
+                        LinkTarget = $dcOU
+                        LinkScope = $gpoType.Scope
+                        Created = $created
+                        Modified = $modified
+                    }
+                }
+
+                'domain-wide' {
+                    $gpoName = "SEC-$($gpoType.Type)"
+
+                    $gpo = Get-GPO -Name $gpoName -ErrorAction SilentlyContinue
+                    $linked = $false
+                    $linkEnabled = $false
+                    $created = $null
+                    $modified = $null
+
+                    if ($gpo) {
+                        $created = $gpo.CreationTime.ToString('o')
+                        $modified = $gpo.ModificationTime.ToString('o')
+
+                        try {
+                            $links = (Get-GPInheritance -Target $domainDN -ErrorAction SilentlyContinue).GpoLinks
+                            $link = $links | Where-Object { $_.DisplayName -eq $gpoName }
+                            if ($link) {
+                                $linked = $true
+                                $linkEnabled = $link.Enabled
+                            }
+                        }
+                        catch {
+                            Write-Verbose "Failed to get GPO links for $gpoName at $domainDN : $_"
+                        }
+                    }
+
+                    $statuses += [PSCustomObject]@{
+                        GpoType = $gpoType.Type
+                        Name = $gpoName
+                        Description = $gpoType.Description
+                        Exists = ($null -ne $gpo)
+                        Linked = $linked
+                        LinkEnabled = $linkEnabled
+                        LinkTarget = $domainDN
+                        LinkScope = $gpoType.Scope
+                        Created = $created
+                        Modified = $modified
+                    }
+                }
+            }
+        }
+
+        Write-TierLog -Message "Retrieved status for $($statuses.Count) endpoint protection GPO types" -Level Success -Component 'GPO'
+        $statuses
+    }
+}
+
+function New-ADAuditBaselineGPO {
+    <#
+    .SYNOPSIS
+        Creates baseline audit policy GPO for a tier.
+
+    .DESCRIPTION
+        Creates and configures a GPO with Microsoft recommended baseline audit policies.
+        Audit categories include:
+        - Account Logon, Account Management, DS Access
+        - Logon/Logoff, Object Access, Policy Change
+        - Privilege Use, System
+
+    .PARAMETER Tier
+        The tier to create the GPO for (Tier0, Tier1, or Tier2).
+
+    .EXAMPLE
+        New-ADAuditBaselineGPO -Tier 'Tier0'
+
+        Creates SEC-Tier0-Audit-Baseline GPO.
+
+    .OUTPUTS
+        PSCustomObject with creation result.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    [OutputType([PSCustomObject])]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('Tier0', 'Tier1', 'Tier2')]
+        [string]$Tier
+    )
+
+    begin {
+        Write-TierLog -Message "Creating audit baseline GPO for $Tier" -Level Info -Component 'GPO'
+
+        if (-not (Test-GroupPolicyModuleAvailable)) {
+            throw "GroupPolicy module not available. Install RSAT tools."
+        }
+    }
+
+    process {
+        $gpoName = "SEC-$Tier-Audit-Baseline"
+        $domainDN = Get-ADDomainRootDN
+        $targetOU = "$($script:TierConfiguration[$Tier].OUPath),$domainDN"
+
+        $result = [PSCustomObject]@{
+            Success = $false
+            GpoName = $gpoName
+            Created = $false
+            Linked = $false
+            Configured = $false
+            Errors = @()
+        }
+
+        if ($PSCmdlet.ShouldProcess($gpoName, "Create Audit Baseline GPO")) {
+            try {
+                # Create GPO if needed
+                $gpo = Get-GPO -Name $gpoName -ErrorAction SilentlyContinue
+                if (-not $gpo) {
+                    $gpo = New-GPO -Name $gpoName -Comment "Microsoft recommended baseline audit policies for $Tier"
+                    $result.Created = $true
+                    Write-TierLog -Message "Created GPO: $gpoName" -Level Success -Component 'GPO'
+                }
+
+                # Link to tier OU
+                $links = (Get-GPInheritance -Target $targetOU -ErrorAction SilentlyContinue).GpoLinks
+                if (-not ($links | Where-Object { $_.DisplayName -eq $gpoName })) {
+                    New-GPLink -Name $gpoName -Target $targetOU -LinkEnabled Yes | Out-Null
+                    Write-TierLog -Message "Linked GPO $gpoName to $targetOU" -Level Success -Component 'GPO'
+                }
+                $result.Linked = $true
+
+                # Configure audit policies
+                $domain = Get-ADDomain
+                $gpoGuid = '{' + $gpo.Id.ToString().ToUpper() + '}'
+                # Use DFS-aware SYSVOL path for resilience
+                $sysvolPath = "\\$($domain.DNSRoot)\SYSVOL\$($domain.DNSRoot)\Policies\$gpoGuid"
+                $secEditPath = Join-Path $sysvolPath "Machine\Microsoft\Windows NT\SecEdit"
+                $gptTmplPath = Join-Path $secEditPath "GptTmpl.inf"
+
+                if (-not (Test-Path $secEditPath)) {
+                    New-Item -Path $secEditPath -ItemType Directory -Force | Out-Null
+                }
+
+                # Create backup before modification
+                Backup-GptTmplFile -GptTmplPath $gptTmplPath | Out-Null
+
+                # Audit policy values: 0=None, 1=Success, 2=Failure, 3=Both
+                # Use merge function to preserve existing settings
+                $auditSettings = @{
+                    'Event Audit' = @{
+                        'AuditSystemEvents' = '3'
+                        'AuditLogonEvents' = '3'
+                        'AuditObjectAccess' = '2'
+                        'AuditPrivilegeUse' = '2'
+                        'AuditPolicyChange' = '3'
+                        'AuditAccountManage' = '3'
+                        'AuditProcessTracking' = '0'
+                        'AuditDSAccess' = '0'
+                        'AuditAccountLogon' = '3'
+                    }
+                }
+
+                $mergedContent = Merge-GptTmplContent -GptTmplPath $gptTmplPath -NewSettings $auditSettings
+                $mergedContent | Out-File -FilePath $gptTmplPath -Encoding Unicode -Force
+
+                # Update GPO version
+                Update-GPOVersion -GPOGuid $gpo.Id
+
+                $result.Configured = $true
+                $result.Success = $true
+
+                Write-TierLog -Message "Configured audit baseline for $gpoName" -Level Success -Component 'GPO'
+            }
+            catch {
+                $result.Errors += $_.Exception.Message
+                Write-TierLog -Message "Failed to create audit baseline GPO: $_" -Level Error -Component 'GPO'
+            }
+        }
+
+        $result
+    }
+}
+
+function New-ADAuditEnhancedGPO {
+    <#
+    .SYNOPSIS
+        Creates enhanced audit policy GPO with PowerShell logging for a tier.
+
+    .DESCRIPTION
+        Creates and configures a GPO with ACSC/NSA hardened audit policies including:
+        - Full audit policy coverage
+        - PowerShell Script Block Logging
+        - PowerShell Module Logging
+        - PowerShell Transcription
+        - Command line process auditing
+
+    .PARAMETER Tier
+        The tier to create the GPO for (Tier0, Tier1, or Tier2).
+
+    .EXAMPLE
+        New-ADAuditEnhancedGPO -Tier 'Tier0'
+
+        Creates SEC-Tier0-Audit-Enhanced GPO.
+
+    .OUTPUTS
+        PSCustomObject with creation result.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    [OutputType([PSCustomObject])]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('Tier0', 'Tier1', 'Tier2')]
+        [string]$Tier
+    )
+
+    begin {
+        Write-TierLog -Message "Creating enhanced audit GPO for $Tier" -Level Info -Component 'GPO'
+
+        if (-not (Test-GroupPolicyModuleAvailable)) {
+            throw "GroupPolicy module not available. Install RSAT tools."
+        }
+    }
+
+    process {
+        $gpoName = "SEC-$Tier-Audit-Enhanced"
+        $domainDN = Get-ADDomainRootDN
+        $targetOU = "$($script:TierConfiguration[$Tier].OUPath),$domainDN"
+
+        $result = [PSCustomObject]@{
+            Success = $false
+            GpoName = $gpoName
+            Created = $false
+            Linked = $false
+            Configured = $false
+            Errors = @()
+        }
+
+        if ($PSCmdlet.ShouldProcess($gpoName, "Create Enhanced Audit GPO")) {
+            try {
+                # Create GPO if needed
+                $gpo = Get-GPO -Name $gpoName -ErrorAction SilentlyContinue
+                if (-not $gpo) {
+                    $gpo = New-GPO -Name $gpoName -Comment "ACSC/NSA hardened audit policies with PowerShell logging for $Tier"
+                    $result.Created = $true
+                }
+
+                # Link to tier OU
+                $links = (Get-GPInheritance -Target $targetOU -ErrorAction SilentlyContinue).GpoLinks
+                if (-not ($links | Where-Object { $_.DisplayName -eq $gpoName })) {
+                    New-GPLink -Name $gpoName -Target $targetOU -LinkEnabled Yes | Out-Null
+                }
+                $result.Linked = $true
+
+                # Configure enhanced audit policies
+                $domain = Get-ADDomain
+                $gpoGuid = '{' + $gpo.Id.ToString().ToUpper() + '}'
+                # Use DFS-aware SYSVOL path for resilience
+                $sysvolPath = "\\$($domain.DNSRoot)\SYSVOL\$($domain.DNSRoot)\Policies\$gpoGuid"
+                $secEditPath = Join-Path $sysvolPath "Machine\Microsoft\Windows NT\SecEdit"
+                $gptTmplPath = Join-Path $secEditPath "GptTmpl.inf"
+
+                if (-not (Test-Path $secEditPath)) {
+                    New-Item -Path $secEditPath -ItemType Directory -Force | Out-Null
+                }
+
+                # Create backup before modification
+                Backup-GptTmplFile -GptTmplPath $gptTmplPath | Out-Null
+
+                # Enhanced audit policies (all success+failure) - use merge function
+                $enhancedAuditSettings = @{
+                    'Event Audit' = @{
+                        'AuditSystemEvents' = '3'
+                        'AuditLogonEvents' = '3'
+                        'AuditObjectAccess' = '3'
+                        'AuditPrivilegeUse' = '3'
+                        'AuditPolicyChange' = '3'
+                        'AuditAccountManage' = '3'
+                        'AuditProcessTracking' = '1'
+                        'AuditDSAccess' = '3'
+                        'AuditAccountLogon' = '3'
+                    }
+                    'Registry Values' = @{
+                        'MACHINE\Software\Microsoft\Windows\CurrentVersion\Policies\System\Audit\ProcessCreationIncludeCmdLine_Enabled' = '4,1'
+                    }
+                }
+
+                $mergedContent = Merge-GptTmplContent -GptTmplPath $gptTmplPath -NewSettings $enhancedAuditSettings
+                $mergedContent | Out-File -FilePath $gptTmplPath -Encoding Unicode -Force
+
+                # Configure PowerShell logging via registry with proper error handling
+                $registryConfigured = $true
+                $registryErrors = [System.Collections.Generic.List[string]]::new()
+
+                try {
+                    Set-GPRegistryValue -Name $gpoName -Key 'HKLM\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging' -ValueName 'EnableScriptBlockLogging' -Type DWord -Value 1 -ErrorAction Stop
+                }
+                catch {
+                    $registryErrors.Add("ScriptBlockLogging: $($_.Exception.Message)")
+                    $registryConfigured = $false
+                }
+
+                try {
+                    Set-GPRegistryValue -Name $gpoName -Key 'HKLM\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ModuleLogging' -ValueName 'EnableModuleLogging' -Type DWord -Value 1 -ErrorAction Stop
+                }
+                catch {
+                    $registryErrors.Add("ModuleLogging: $($_.Exception.Message)")
+                    $registryConfigured = $false
+                }
+
+                try {
+                    Set-GPRegistryValue -Name $gpoName -Key 'HKLM\SOFTWARE\Policies\Microsoft\Windows\PowerShell\Transcription' -ValueName 'EnableTranscripting' -Type DWord -Value 1 -ErrorAction Stop
+                }
+                catch {
+                    $registryErrors.Add("Transcription: $($_.Exception.Message)")
+                    $registryConfigured = $false
+                }
+
+                try {
+                    Set-GPRegistryValue -Name $gpoName -Key 'HKLM\SOFTWARE\Policies\Microsoft\Windows\PowerShell\Transcription' -ValueName 'EnableInvocationHeader' -Type DWord -Value 1 -ErrorAction Stop
+                }
+                catch {
+                    $registryErrors.Add("InvocationHeader: $($_.Exception.Message)")
+                    $registryConfigured = $false
+                }
+
+                if (-not $registryConfigured) {
+                    $result.Errors += $registryErrors
+                    Write-Warning "Some PowerShell logging settings failed to configure: $($registryErrors -join '; ')"
+                }
+
+                # Update GPO version
+                Update-GPOVersion -GPOGuid $gpo.Id
+
+                $result.Configured = $registryConfigured
+                $result.Success = $registryConfigured
+
+                Write-TierLog -Message "Configured enhanced audit for $gpoName (Registry settings: $(if($registryConfigured){'Success'}else{'Partial'}))" -Level $(if($registryConfigured){'Success'}else{'Warning'}) -Component 'GPO'
+            }
+            catch {
+                $result.Errors += $_.Exception.Message
+                Write-TierLog -Message "Failed to create enhanced audit GPO: $_" -Level Error -Component 'GPO'
+            }
+        }
+
+        $result
+    }
+}
+
+function New-ADDcAuditEssentialGPO {
+    <#
+    .SYNOPSIS
+        Creates essential audit GPO for Domain Controllers.
+
+    .DESCRIPTION
+        Creates and configures a GPO with essential audit policies specifically
+        designed for Domain Controllers.
+
+    .EXAMPLE
+        New-ADDcAuditEssentialGPO
+
+        Creates SEC-DC-Audit-Essential GPO.
+
+    .OUTPUTS
+        PSCustomObject with creation result.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    [OutputType([PSCustomObject])]
+    param()
+
+    begin {
+        Write-TierLog -Message "Creating DC essential audit GPO" -Level Info -Component 'GPO'
+
+        if (-not (Test-GroupPolicyModuleAvailable)) {
+            throw "GroupPolicy module not available. Install RSAT tools."
+        }
+    }
+
+    process {
+        $gpoName = "SEC-DC-Audit-Essential"
+        $domainDN = Get-ADDomainRootDN
+        $dcOU = "OU=Domain Controllers,$domainDN"
+
+        $result = [PSCustomObject]@{
+            Success = $false
+            GpoName = $gpoName
+            Created = $false
+            Linked = $false
+            Configured = $false
+            Errors = @()
+        }
+
+        if ($PSCmdlet.ShouldProcess($gpoName, "Create DC Essential Audit GPO")) {
+            try {
+                # Create GPO if needed
+                $gpo = Get-GPO -Name $gpoName -ErrorAction SilentlyContinue
+                if (-not $gpo) {
+                    $gpo = New-GPO -Name $gpoName -Comment "Essential security audit policies for Domain Controllers"
+                    $result.Created = $true
+                }
+
+                # Link to Domain Controllers OU
+                $links = (Get-GPInheritance -Target $dcOU -ErrorAction SilentlyContinue).GpoLinks
+                if (-not ($links | Where-Object { $_.DisplayName -eq $gpoName })) {
+                    New-GPLink -Name $gpoName -Target $dcOU -LinkEnabled Yes | Out-Null
+                }
+                $result.Linked = $true
+
+                # Configure DC audit policies
+                $domain = Get-ADDomain
+                $gpoGuid = '{' + $gpo.Id.ToString().ToUpper() + '}'
+                # Use DFS-aware SYSVOL path for resilience
+                $sysvolPath = "\\$($domain.DNSRoot)\SYSVOL\$($domain.DNSRoot)\Policies\$gpoGuid"
+                $secEditPath = Join-Path $sysvolPath "Machine\Microsoft\Windows NT\SecEdit"
+                $gptTmplPath = Join-Path $secEditPath "GptTmpl.inf"
+
+                if (-not (Test-Path $secEditPath)) {
+                    New-Item -Path $secEditPath -ItemType Directory -Force | Out-Null
+                }
+
+                # Create backup before modification
+                Backup-GptTmplFile -GptTmplPath $gptTmplPath | Out-Null
+
+                # Use merge function to preserve existing settings
+                $dcEssentialSettings = @{
+                    'Event Audit' = @{
+                        'AuditSystemEvents' = '3'
+                        'AuditLogonEvents' = '3'
+                        'AuditObjectAccess' = '3'
+                        'AuditPrivilegeUse' = '3'
+                        'AuditPolicyChange' = '3'
+                        'AuditAccountManage' = '3'
+                        'AuditProcessTracking' = '0'
+                        'AuditDSAccess' = '3'
+                        'AuditAccountLogon' = '3'
+                    }
+                }
+
+                $mergedContent = Merge-GptTmplContent -GptTmplPath $gptTmplPath -NewSettings $dcEssentialSettings
+                $mergedContent | Out-File -FilePath $gptTmplPath -Encoding Unicode -Force
+                Update-GPOVersion -GPOGuid $gpo.Id
+
+                $result.Configured = $true
+                $result.Success = $true
+
+                Write-TierLog -Message "Configured DC essential audit GPO" -Level Success -Component 'GPO'
+            }
+            catch {
+                $result.Errors += $_.Exception.Message
+                Write-TierLog -Message "Failed to create DC essential audit GPO: $_" -Level Error -Component 'GPO'
+            }
+        }
+
+        $result
+    }
+}
+
+function New-ADDcAuditComprehensiveGPO {
+    <#
+    .SYNOPSIS
+        Creates comprehensive forensic audit GPO for Domain Controllers.
+
+    .DESCRIPTION
+        Creates and configures a GPO with comprehensive forensic audit policies
+        for Domain Controllers, including NTDS diagnostics logging.
+
+    .EXAMPLE
+        New-ADDcAuditComprehensiveGPO
+
+        Creates SEC-DC-Audit-Comprehensive GPO.
+
+    .OUTPUTS
+        PSCustomObject with creation result.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    [OutputType([PSCustomObject])]
+    param()
+
+    begin {
+        Write-TierLog -Message "Creating DC comprehensive audit GPO" -Level Info -Component 'GPO'
+
+        if (-not (Test-GroupPolicyModuleAvailable)) {
+            throw "GroupPolicy module not available. Install RSAT tools."
+        }
+    }
+
+    process {
+        $gpoName = "SEC-DC-Audit-Comprehensive"
+        $domainDN = Get-ADDomainRootDN
+        $dcOU = "OU=Domain Controllers,$domainDN"
+
+        $result = [PSCustomObject]@{
+            Success = $false
+            GpoName = $gpoName
+            Created = $false
+            Linked = $false
+            Configured = $false
+            Errors = @()
+        }
+
+        if ($PSCmdlet.ShouldProcess($gpoName, "Create DC Comprehensive Audit GPO")) {
+            try {
+                # Create GPO if needed
+                $gpo = Get-GPO -Name $gpoName -ErrorAction SilentlyContinue
+                if (-not $gpo) {
+                    $gpo = New-GPO -Name $gpoName -Comment "Comprehensive forensic audit policies for Domain Controllers"
+                    $result.Created = $true
+                }
+
+                # Link to Domain Controllers OU
+                $links = (Get-GPInheritance -Target $dcOU -ErrorAction SilentlyContinue).GpoLinks
+                if (-not ($links | Where-Object { $_.DisplayName -eq $gpoName })) {
+                    New-GPLink -Name $gpoName -Target $dcOU -LinkEnabled Yes | Out-Null
+                }
+                $result.Linked = $true
+
+                # Configure comprehensive DC audit policies
+                $domain = Get-ADDomain
+                $gpoGuid = '{' + $gpo.Id.ToString().ToUpper() + '}'
+                # Use DFS-aware SYSVOL path for resilience
+                $sysvolPath = "\\$($domain.DNSRoot)\SYSVOL\$($domain.DNSRoot)\Policies\$gpoGuid"
+                $secEditPath = Join-Path $sysvolPath "Machine\Microsoft\Windows NT\SecEdit"
+                $gptTmplPath = Join-Path $secEditPath "GptTmpl.inf"
+
+                if (-not (Test-Path $secEditPath)) {
+                    New-Item -Path $secEditPath -ItemType Directory -Force | Out-Null
+                }
+
+                # Create backup before modification
+                Backup-GptTmplFile -GptTmplPath $gptTmplPath | Out-Null
+
+                # All events audited - use merge function
+                $dcComprehensiveSettings = @{
+                    'Event Audit' = @{
+                        'AuditSystemEvents' = '3'
+                        'AuditLogonEvents' = '3'
+                        'AuditObjectAccess' = '3'
+                        'AuditPrivilegeUse' = '3'
+                        'AuditPolicyChange' = '3'
+                        'AuditAccountManage' = '3'
+                        'AuditProcessTracking' = '3'
+                        'AuditDSAccess' = '3'
+                        'AuditAccountLogon' = '3'
+                    }
+                    'Registry Values' = @{
+                        'MACHINE\Software\Microsoft\Windows\CurrentVersion\Policies\System\Audit\ProcessCreationIncludeCmdLine_Enabled' = '4,1'
+                    }
+                }
+
+                $mergedContent = Merge-GptTmplContent -GptTmplPath $gptTmplPath -NewSettings $dcComprehensiveSettings
+                $mergedContent | Out-File -FilePath $gptTmplPath -Encoding Unicode -Force
+
+                # Enable NTDS diagnostics with proper error handling
+                $ntdsConfigured = $true
+                try {
+                    Set-GPRegistryValue -Name $gpoName -Key 'HKLM\SYSTEM\CurrentControlSet\Services\NTDS\Diagnostics' -ValueName '15 Field Engineering' -Type DWord -Value 5 -ErrorAction Stop
+                }
+                catch {
+                    $result.Errors += "NTDS Field Engineering: $($_.Exception.Message)"
+                    $ntdsConfigured = $false
+                }
+
+                try {
+                    Set-GPRegistryValue -Name $gpoName -Key 'HKLM\SYSTEM\CurrentControlSet\Services\NTDS\Diagnostics' -ValueName '16 LDAP Interface Events' -Type DWord -Value 2 -ErrorAction Stop
+                }
+                catch {
+                    $result.Errors += "NTDS LDAP Events: $($_.Exception.Message)"
+                    $ntdsConfigured = $false
+                }
+
+                Update-GPOVersion -GPOGuid $gpo.Id
+
+                $result.Configured = $ntdsConfigured
+                $result.Success = $ntdsConfigured
+
+                Write-TierLog -Message "Configured DC comprehensive audit GPO (NTDS: $(if($ntdsConfigured){'Success'}else{'Partial'}))" -Level $(if($ntdsConfigured){'Success'}else{'Warning'}) -Component 'GPO'
+            }
+            catch {
+                $result.Errors += $_.Exception.Message
+                Write-TierLog -Message "Failed to create DC comprehensive audit GPO: $_" -Level Error -Component 'GPO'
+            }
+        }
+
+        $result
+    }
+}
+
+function New-ADDefenderProtectionGPO {
+    <#
+    .SYNOPSIS
+        Creates Windows Defender configuration GPO (domain-wide).
+
+    .DESCRIPTION
+        Creates and configures a GPO with Windows Defender Antivirus settings:
+        - Real-time protection enabled
+        - Cloud-delivered protection enabled
+        - Automatic sample submission
+        - PUA protection enabled
+
+    .EXAMPLE
+        New-ADDefenderProtectionGPO
+
+        Creates SEC-DefenderProtection GPO.
+
+    .OUTPUTS
+        PSCustomObject with creation result.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    [OutputType([PSCustomObject])]
+    param()
+
+    begin {
+        Write-TierLog -Message "Creating Defender protection GPO" -Level Info -Component 'GPO'
+
+        if (-not (Test-GroupPolicyModuleAvailable)) {
+            throw "GroupPolicy module not available. Install RSAT tools."
+        }
+    }
+
+    process {
+        $gpoName = "SEC-DefenderProtection"
+        $domainDN = Get-ADDomainRootDN
+
+        $result = [PSCustomObject]@{
+            Success = $false
+            GpoName = $gpoName
+            Created = $false
+            Linked = $false
+            Configured = $false
+            Errors = @()
+        }
+
+        if ($PSCmdlet.ShouldProcess($gpoName, "Create Defender Protection GPO")) {
+            try {
+                # Create GPO if needed
+                $gpo = Get-GPO -Name $gpoName -ErrorAction SilentlyContinue
+                if (-not $gpo) {
+                    $gpo = New-GPO -Name $gpoName -Comment "Microsoft Defender Antivirus balanced protection settings"
+                    $result.Created = $true
+                }
+
+                # Link to domain root
+                $links = (Get-GPInheritance -Target $domainDN -ErrorAction SilentlyContinue).GpoLinks
+                if (-not ($links | Where-Object { $_.DisplayName -eq $gpoName })) {
+                    New-GPLink -Name $gpoName -Target $domainDN -LinkEnabled Yes | Out-Null
+                }
+                $result.Linked = $true
+
+                # Configure Defender settings
+                # Real-time Protection
+                Set-GPRegistryValue -Name $gpoName -Key 'HKLM\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection' -ValueName 'DisableRealtimeMonitoring' -Type DWord -Value 0
+                Set-GPRegistryValue -Name $gpoName -Key 'HKLM\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection' -ValueName 'DisableBehaviorMonitoring' -Type DWord -Value 0
+                Set-GPRegistryValue -Name $gpoName -Key 'HKLM\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection' -ValueName 'DisableOnAccessProtection' -Type DWord -Value 0
+                Set-GPRegistryValue -Name $gpoName -Key 'HKLM\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection' -ValueName 'DisableScanOnRealtimeEnable' -Type DWord -Value 0
+
+                # Cloud Protection (MAPS)
+                Set-GPRegistryValue -Name $gpoName -Key 'HKLM\SOFTWARE\Policies\Microsoft\Windows Defender\Spynet' -ValueName 'SpynetReporting' -Type DWord -Value 2
+                Set-GPRegistryValue -Name $gpoName -Key 'HKLM\SOFTWARE\Policies\Microsoft\Windows Defender\Spynet' -ValueName 'SubmitSamplesConsent' -Type DWord -Value 1
+
+                # PUA Protection
+                Set-GPRegistryValue -Name $gpoName -Key 'HKLM\SOFTWARE\Policies\Microsoft\Windows Defender' -ValueName 'PUAProtection' -Type DWord -Value 1
+
+                # Scan settings
+                Set-GPRegistryValue -Name $gpoName -Key 'HKLM\SOFTWARE\Policies\Microsoft\Windows Defender\Scan' -ValueName 'DisableEmailScanning' -Type DWord -Value 0
+                Set-GPRegistryValue -Name $gpoName -Key 'HKLM\SOFTWARE\Policies\Microsoft\Windows Defender\Scan' -ValueName 'DisableRemovableDriveScanning' -Type DWord -Value 0
+                Set-GPRegistryValue -Name $gpoName -Key 'HKLM\SOFTWARE\Policies\Microsoft\Windows Defender\Scan' -ValueName 'DisableArchiveScanning' -Type DWord -Value 0
+
+                # Ensure Defender is not disabled
+                Set-GPRegistryValue -Name $gpoName -Key 'HKLM\SOFTWARE\Policies\Microsoft\Windows Defender' -ValueName 'DisableAntiSpyware' -Type DWord -Value 0
+
+                Update-GPOVersion -GPOGuid $gpo.Id
+
+                $result.Configured = $true
+                $result.Success = $true
+
+                Write-TierLog -Message "Configured Defender protection GPO" -Level Success -Component 'GPO'
+            }
+            catch {
+                $result.Errors += $_.Exception.Message
+                Write-TierLog -Message "Failed to create Defender protection GPO: $_" -Level Error -Component 'GPO'
+            }
+        }
+
+        $result
+    }
+}
+
+#endregion
+
 Export-ModuleMember -Function @(
     # Initialization
     'Initialize-ADTierModel',
     'Get-ADTierConfiguration',
-    
+    'Get-ADTierInitializationStatus',
+
     # Tier 0 Detection
     'Get-ADTier0Infrastructure',
     'Test-ADTier0Placement',
     'Move-ADTier0Infrastructure',
-    
+    'Get-ADFSMORoleHolders',
+
     # Tier Management
     'New-ADTier',
     'Get-ADTier',
     'Set-ADTierMember',
     'Remove-ADTierMember',
     'Get-ADTierMember',
-    
+    'Get-ADTierCounts',
+
     # OU Management
     'New-ADTierOUStructure',
     'Get-ADTierOUStructure',
-    
+
     # Group Management
     'New-ADTierGroup',
     'Get-ADTierGroup',
     'Add-ADTierGroupMember',
     'Remove-ADTierGroupMember',
-    
+    'Get-ADTransitiveGroupMembership',
+    'Resolve-ADPrimaryGroup',
+    'Get-ADLargeGroupMembers',
+
     # Permission Management
     'Set-ADTierPermission',
     'Get-ADTierPermission',
     'Test-ADTierPermissionCompliance',
-    
+
     # Auditing and Monitoring
     'Get-ADTierAccessReport',
     'Get-ADTierViolation',
     'Test-ADTierCompliance',
     'Export-ADTierAuditLog',
-    
+
     # Security Policies
     'Set-ADTierAuthenticationPolicy',
     'Get-ADTierAuthenticationPolicy',
     'Set-ADTierPasswordPolicy',
-    
+
     # Cross-Tier Detection
     'Find-ADCrossTierAccess',
     'Find-ADTierMisconfiguration',
     'Repair-ADTierViolation',
-    
+
     # GPO Security Configuration
     'Set-ADTierLogonRestrictions',
     'Set-GPOUserRight',
     'Get-ADTierLogonRestrictions',
     'Test-ADTierLogonRestrictions',
     'Get-GPOLinks',
-    
+
     # Admin Account Management
     'New-ADTierAdminAccount',
     'Set-ADTierAccountLockoutProtection',
     'Get-ADTierAdminAccount',
-    
+
     # Enhanced Security Policies
     'Set-ADTierSecurityPolicy',
     'Set-GPOSecurityOption',
     'Set-GPOAuditPolicy',
     'Set-GPOFirewall',
-    'Set-GPORegistryValue'
+    'Set-GPORegistryValue',
+
+    # Compliance (from Rust port)
+    'Get-ADTierComplianceScore',
+    'Disable-ADStaleAccounts',
+    'Set-ADServiceAccountHardening',
+
+    # Diagnostics (from Rust port)
+    'Test-ADConnection',
+
+    # Endpoint Protection GPOs (from Rust port)
+    'Get-ADEndpointProtectionStatus',
+    'New-ADAuditBaselineGPO',
+    'New-ADAuditEnhancedGPO',
+    'New-ADDcAuditEssentialGPO',
+    'New-ADDcAuditComprehensiveGPO',
+    'New-ADDefenderProtectionGPO'
 )
