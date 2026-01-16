@@ -36,7 +36,7 @@ function Initialize-TierDataDirectory {
         Set-Acl -Path $fullPath -AclObject $acl
     }
     catch {
-        Write-Warning "Unable to harden directory permissions for $fullPath: $_"
+        Write-Warning "Unable to harden directory permissions for ${fullPath}: $_"
     }
 }
 
